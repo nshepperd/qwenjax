@@ -1,0 +1,54 @@
+[project]
+name = "qwen-jax"
+version = "0.1.0"
+description = "Qwen3-VL vision-language model in JAX/Equinox"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "jax[cuda12]>=0.8.2",
+    "equinox",
+    "bitsandbytes-jax @ git+https://github.com/nshepperd/bitsandbytes-jax.git@main",
+    "flash_attn_jax==0.6.2",
+    "transformers==4.57.3",
+    "einops",
+    "jax-tqdm",
+    "pydantic",
+]
+
+[dependency-groups]
+test = [
+    "pytest",
+    "Pillow",
+    "accelerate",
+    "ipykernel",
+    "ipywidgets",
+    "pip",
+    "lovely-tensors",
+    "lovely-jax",
+    "torchvision",
+    "treescope",
+    "optax",
+    "wandb",
+]
+
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qwen_jax"]
+
+[tool.ruff]
+ignore = ["F722", "F821"]
+
+[tool.pyrefly]
+project-includes = [
+    ".",
+    "src",
+]
+search-path = [
+    "src",
+]
+
+[tool.hatch]
+metadata.allow-direct-references = true
