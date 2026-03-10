@@ -29,6 +29,7 @@ test = [
     "treescope",
     "optax",
     "wandb",
+    "hypothesis",
 ]
 
 [build-system]
@@ -41,14 +42,8 @@ packages = ["src/qwen_jax"]
 [tool.ruff]
 ignore = ["F722", "F821"]
 
-[tool.pyrefly]
-project-includes = [
-    ".",
-    "src",
-]
-search-path = [
-    "src",
-]
-
 [tool.hatch]
 metadata.allow-direct-references = true
+
+[tool.ty.environment]
+root = ["./src/"]
