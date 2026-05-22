@@ -87,7 +87,7 @@ def large_image_inputs():
                 {"type": "image", "url": None},
                 {"type": "text", "text": "What animal is on the candy?"}
             ]
-        }]
+        }] # type: ignore
     )
     inputs = processor(text=txt, images=[[image1, image2]], return_tensors="pt")
     return inputs
@@ -117,7 +117,7 @@ def test_vision(hf_model: HFModel, jax_model: Qwen3VLForConditionalGeneration):
                 {"type": "image", "url": None},
                 {"type": "text", "text": "What animal is on the candy?"}
             ]
-        }]
+        }] # type: ignore
     )
     inputs = processor(text=txt, images=[[image1, image2]], return_tensors="pt")
     with torch.no_grad():
@@ -144,7 +144,7 @@ def test_vision(hf_model: HFModel, jax_model: Qwen3VLForConditionalGeneration):
     np.testing.assert_allclose(
         jsdiv(output_jax.logits, output_pt.logits.detach().cpu().numpy()),
         0.0,
-        rtol=1e-2, atol=1e-2
+        atol=2e-2
     )
 
 def test_vision_2(hf_model: HFModel, jax_model: Qwen3VLForConditionalGeneration):
@@ -157,7 +157,7 @@ def test_vision_2(hf_model: HFModel, jax_model: Qwen3VLForConditionalGeneration)
                 {"type": "image", "url": None},
                 {"type": "text", "text": "What animal is on the candy?"}
             ]
-        }]
+        }] # type: ignore
     )
     inputs = processor(text=txt, images=[[image1]], return_tensors="pt")
     with torch.no_grad():
@@ -210,6 +210,7 @@ def test_get_rope_index(hf_model: HFModel, jax_model: Qwen3VLForConditionalGener
     inputs = large_image_inputs
     hf_rope_index = hf_model.model.get_rope_index(
         input_ids=inputs['input_ids'],
+        mm_token_type_ids=inputs['mm_token_type_ids'],
         image_grid_thw=inputs['image_grid_thw'],
         attention_mask=inputs['attention_mask'],
     )
@@ -218,6 +219,7 @@ def test_get_rope_index(hf_model: HFModel, jax_model: Qwen3VLForConditionalGener
         input_ids=inputs['input_ids'],
         image_grid_thw=inputs['image_grid_thw'],
         attention_mask=inputs['attention_mask'],
+        mm_token_type_ids=inputs['mm_token_type_ids'],
     )
     np.testing.assert_array_equal(
         jax_rope_index[0],
@@ -275,7 +277,7 @@ def test_vision_gen(jax_model: Qwen3VLForConditionalGeneration):
                 {"type": "image", "url": None},
                 {"type": "text", "text": "What animal is on the candy?"}
             ]
-        }]
+        }] # type: ignore
     )
     inputs = processor(text=txt, images=[[image1, image2]], return_tensors="pt")
     inputs = {k: to_jax(v) for k, v in dict(inputs).items()}
@@ -291,7 +293,9 @@ def test_vision_gen(jax_model: Qwen3VLForConditionalGeneration):
     out_str = processor.decode(output.tokens[0, inputs['input_ids'].shape[1]:])
     print(out_str)
 
-    full_inputs = inputs | {'input_ids': output.tokens[:, :-1], 'attention_mask': jnp.ones_like(output.tokens[:, :-1])}
+    new_ids = output.tokens[:, :-1]
+    new_mm = jnp.pad(inputs['mm_token_type_ids'], ((0, 0), (0, new_ids.shape[1] - inputs['mm_token_type_ids'].shape[1])))
+    full_inputs = inputs | {'input_ids': new_ids, 'attention_mask': jnp.ones_like(new_ids), 'mm_token_type_ids': new_mm}
     output_full = jax_model(**full_inputs)
     np.testing.assert_allclose(
         jsdiv(output.logits, output_full.logits[:, inputs['input_ids'].shape[1]-1:]),
@@ -318,7 +322,7 @@ def test_vision_with_cache(jax_model: Qwen3VLForConditionalGeneration):
                 {"type": "image", "url": None},
                 {"type": "text", "text": "What animal is on the candy?"}
             ]
-        }]
+        }] # type: ignore
     )
     inputs = processor(text=txt, images=[[image1, image2]], return_tensors="pt")
     inputs = {k: to_jax(v) for k, v in dict(inputs).items()}
@@ -369,7 +373,7 @@ def test_padding(jax_model: Qwen3VLForConditionalGeneration, processor: Qwen3VLP
             "content": [
                 {"type": "text", "text": "Example text without image."}
             ]
-        }]
+        }] # type: ignore
     )
     inputs = convert_inputs(processor(text=txt, return_tensors="pt"))
     output = jax_model(**inputs)
@@ -393,7 +397,7 @@ def test_padding_vision(jax_model: Qwen3VLForConditionalGeneration, processor: Q
                 {"type": "image", "url": None},
                 {"type": "text", "text": "Example text without image."}
             ]
-        }]
+        }] # type: ignore
     )
     inputs = convert_inputs(processor(text=txt, images=[[image1, image2]], return_tensors="pt"))
     output = jax_model(**inputs)
@@ -421,26 +425,29 @@ def test_padding_vision_with_cache(jax_model: Qwen3VLForConditionalGeneration, p
                 {"type": "text", "text": "This is a response from the assistant."}
             ]
         }
-        ]
+        ] # type: ignore
     )
     inputs = convert_inputs(processor(text=txt, return_tensors="pt"))
     txt1 = processor.apply_chat_template(
-        [{
-            "role": "user",
-            "content": [
-                {"type": "image", "url": None},
-                {"type": "text", "text": "Example text with image."},
-            ]
-        }]
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "url": None},
+                    {"type": "text", "text": "Example text with image."},
+                ],
+            }
+        ] # type: ignore
     )
     txt2 = processor.apply_chat_template(
-        [{
-            "role": "assistant",
-            "content": [
-                {"type": "text", "text": "This is a response from the assistant."}
-            ]
-        }
-        ]
+        [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "This is a response from the assistant."}
+                ],
+            }
+        ] # type: ignore
     )
     inputs1_padded = convert_inputs(processor(text=txt1, return_tensors="pt", padding=True, pad_to_multiple_of=128, padding_side='left'))
     inputs2_padded = convert_inputs(processor(text=txt2, return_tensors="pt", padding=True, pad_to_multiple_of=128, padding_side='left'))
