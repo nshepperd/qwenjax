@@ -2171,7 +2171,7 @@ requires-dist = [
     { name = "jax", extras = ["cuda12"], specifier = ">=0.8.2" },
     { name = "jax-tqdm" },
     { name = "pydantic" },
-    { name = "transformers", specifier = "==5.3.*" },
+    { name = "transformers", specifier = ">=5.3.0" },
 ]
 
 [package.metadata.requires-dev]
