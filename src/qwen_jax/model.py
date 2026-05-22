@@ -101,6 +101,7 @@ class Qwen3VLModel(eqx.Module):
         input_ids: Int[Array, "batch seq"],
         image_grid_thw: Optional[Int[Array, "num_images 3"]] = None,
         attention_mask: Optional[Float[Array, "batch seq"]] = None,
+        mm_token_type_ids: Optional[Int[Array, "batch seq"]] = None,
     ) -> tuple[Int[Array, "3 batch seq"], Int[Array, "batch 1"]]:
         """Compute 3D position IDs for MRoPE (JIT-compatible).
 
@@ -111,14 +112,14 @@ class Qwen3VLModel(eqx.Module):
             input_ids: Token IDs (batch, seq)
             image_grid_thw: Grid dimensions for each image
             attention_mask: Attention mask
+            mm_token_type_ids: Per-token modality (0=text, 1=image, 2=video).
+                If None, derived from input_ids using image_token_id/video_token_id.
 
         Returns:
             (position_ids, rope_deltas) tuple
         """
         batch_size, seq_len = input_ids.shape
         spatial_merge_size = self.config.vision_config.spatial_merge_size
-        image_token_id = self.config.image_token_id
-        vision_start_token_id = self.config.vision_start_token_id
 
         attention_mask = attention_mask[:, -seq_len:] if attention_mask is not None else None
 
@@ -142,11 +143,13 @@ class Qwen3VLModel(eqx.Module):
         if attention_mask is None:
             attention_mask = jnp.ones_like(input_ids)
 
-        # Mask invalid tokens
-        valid_ids = jnp.where(attention_mask == 1, input_ids, -1)
-
-        # Identify image tokens
-        image_mask = (valid_ids == image_token_id)  # (batch, seq)
+        # Derive image_mask from mm_token_type_ids (preferred) or input_ids (fallback)
+        if mm_token_type_ids is not None:
+            image_mask = (mm_token_type_ids == 1) & (attention_mask == 1)
+        else:
+            image_token_id = self.config.image_token_id
+            valid_ids = jnp.where(attention_mask == 1, input_ids, -1)
+            image_mask = (valid_ids == image_token_id)
 
         # Compute LLM grid dimensions for each image
         llm_grid_t = image_grid_thw[:, 0]
@@ -155,11 +158,10 @@ class Qwen3VLModel(eqx.Module):
         tokens_per_image = llm_grid_t * llm_grid_h * llm_grid_w  # (num_images,)
         num_images = image_grid_thw.shape[0]
 
-        # Count images per batch item
-        # Images are detected by vision_start_token followed by image_token
-        vision_start_mask = (valid_ids == vision_start_token_id)
-        shifted_ids = jnp.roll(valid_ids, -1, axis=-1)
-        image_start_mask = vision_start_mask & (shifted_ids == image_token_id)
+        # Count images per batch item by counting segment-starts of image_mask.
+        # A segment starts where image_mask is True and the previous position is not.
+        shifted_image_mask = jnp.pad(image_mask[:, :-1], ((0, 0), (1, 0)))
+        image_start_mask = image_mask & ~shifted_image_mask
         images_per_batch = jnp.sum(image_start_mask, axis=-1)  # (batch,)
 
         # Cumulative images before each batch item -> global image index offset
@@ -286,6 +288,7 @@ class Qwen3VLModel(eqx.Module):
         cache: Optional[KVCache] = None,
         cache_position: Optional[Int[Array, ""]] = None,
         rope_deltas: Optional[Int[Array, "batch 1"]] = None,
+        mm_token_type_ids: Optional[Int[Array, "batch seq"]] = None,
     ) -> tuple[Float[Array, "batch seq hidden"], Optional[KVCache], Int[Array, "batch 1"]]:
         """Forward pass.
 
@@ -297,6 +300,7 @@ class Qwen3VLModel(eqx.Module):
             position_ids: Pre-computed position IDs (3, batch, seq)
             cache: KV cache
             cache_position: Position in cache
+            mm_token_type_ids: Per-token modality (0 text, 1 image, 2 video) from processor
 
         Returns:
             (hidden_states, new_cache, rope_deltas) tuple
@@ -341,7 +345,7 @@ class Qwen3VLModel(eqx.Module):
         new_rope_deltas = jnp.zeros((batch_size, 1), dtype=jnp.int32)
         if position_ids is None:
             position_ids, new_rope_deltas = self.get_rope_index(
-                input_ids, image_grid_thw, attention_mask
+                input_ids, image_grid_thw, attention_mask, mm_token_type_ids
             )
             position_ids += rope_deltas
             if cache is not None:
@@ -462,6 +466,7 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
         cache: Optional[KVCache] = None,
         rope_deltas: Optional[Int[Array, "batch 1"]] = None,
         use_cache: bool = False,
+        mm_token_type_ids: Optional[Int[Array, "batch seq"]] = None,
     ) -> Qwen3VLOutput:
         """Forward pass.
 
@@ -502,6 +507,7 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
             cache=cache,
             cache_position=cache.position if cache is not None else None,
             rope_deltas=rope_deltas,
+            mm_token_type_ids=mm_token_type_ids,
         )
 
         logits = self.lm_head(hidden_states)
@@ -530,6 +536,7 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
         return_logits: bool = False,
         stop_token_id: int = -1,
         pad_token_id: int = 0,
+        mm_token_type_ids: Optional[Int[Array, "batch seq"]] = None,
     ) -> Qwen3VLGenerateOutput:
         """Generate tokens using jax.lax.scan for efficiency.
 
@@ -581,6 +588,7 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
             attention_mask=attention_mask,
             cache=cache,
             rope_deltas=rope_deltas,
+            mm_token_type_ids=mm_token_type_ids,
         )
 
         def sample(logits, key):
