@@ -632,12 +632,16 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
         assert output.cache is not None, "Cache should not be None after forward pass"
         cache = output.cache
 
-        # === Step 4: Decode loop setup ===
+        # === Step 4: Decode loop ===
+        # stop_token_id < 0 disables early stopping entirely. Track which batch
+        # items have already emitted the stop token so each item halts on its own
+        # schedule and emits pad afterwards.
+        stop_active = stop_token_id >= 0
+        done_init = stop_active & (first_token == stop_token_id)
         keys = jax.random.split(key, max_new_tokens)
 
-        # === Step 5: Scan step function ===
         def while_step(carry):
-            cache, token, rng, step_idx, tokens, all_logits = carry
+            cache, token, step_idx, tokens, all_logits, done_mask = carry
             if progress_bar:
                 jax.debug.print("Decoding step {}/{}", step_idx, max_new_tokens-1)
 
@@ -648,44 +652,45 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
                 image_grid_thw=None,
                 attention_mask=attention_mask,
                 cache=cache,
-                rope_deltas=output.rope_deltas
+                rope_deltas=output.rope_deltas,
             )
 
-            # Sample next token
             assert out.logits.shape[1] == 1, "Logits should have sequence length 1 during decode"
             logits = out.logits[:, -1, :]  # (batch, vocab)
-            rng, subkey = jax.random.split(rng)
-            next_token = jnp.where(
+            sampled = jnp.where(
                 temperature > 0,
                 jax.random.categorical(keys[step_idx], logits / temperature, axis=-1),
                 jnp.argmax(logits, axis=-1),
             )
+            # Items that already stopped emit pad; everyone else gets the sample.
+            next_token = jnp.where(done_mask, pad_token_id, sampled)
+            new_done_mask = done_mask | (stop_active & (next_token == stop_token_id))
 
             if all_logits is not None:
                 all_logits = all_logits.at[:, step_idx, :].set(logits)
             tokens = tokens.at[:, step_idx].set(next_token)
 
-            return (out.cache, next_token, rng, step_idx+1, tokens, all_logits)
+            return (out.cache, next_token, step_idx+1, tokens, all_logits, new_done_mask)
 
         def while_cond(carry):
-            _, token, _, step_idx, tokens, _ = carry
-            not_done = (stop_token_id < 0) | jnp.any(token != stop_token_id)
-            return not_done & (step_idx < max_new_tokens - 1)
+            _, _, step_idx, _, _, done_mask = carry
+            all_done = stop_active & jnp.all(done_mask)
+            return (~all_done) & (step_idx < max_new_tokens - 1)
 
-        # === Step 6: Run decode loop ===
+        # === Step 5: Run decode loop ===
         if max_new_tokens > 1:
             tokens = jnp.full((batch_size, max_new_tokens - 1), pad_token_id, dtype=jnp.int32)
             if return_logits:
                 all_logits = jnp.zeros((batch_size, max_new_tokens - 1, self.vocab_size), dtype=jnp.float32)
             else:
                 all_logits = None
-            init = (cache, first_token, key, 0, tokens, all_logits)
+            init = (cache, first_token, 0, tokens, all_logits, done_init)
             final_carry = jax.lax.while_loop(
                 while_cond,
                 while_step,
                 init
             )
-            final_cache, _, _, _, gen_tokens, gen_logits = final_carry
+            final_cache, _, _, gen_tokens, gen_logits, _ = final_carry
             gen_logits: Array
             all_tokens = jnp.concatenate(
                 [input_ids, first_token[:, None], gen_tokens], axis=1
