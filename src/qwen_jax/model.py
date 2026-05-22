@@ -7,7 +7,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 from einops import rearrange
-from jaxtyping import Array, Float, Int, PRNGKeyArray
+from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 from transformers import Qwen3VLConfig
 
 from . import equinox_utils as eu
@@ -278,6 +278,106 @@ class Qwen3VLModel(eqx.Module):
 
         return position_ids, rope_deltas
 
+    def _splice_image_embeds(
+        self,
+        input_ids: Int[Array, "batch seq"],
+        pixel_values: Optional[Float[Array, "total_patches C*T*H*W"]],
+        image_grid_thw: Optional[Int[Array, "num_images 3"]],
+        mm_token_type_ids: Optional[Int[Array, "batch seq"]],
+    ) -> tuple[
+        Float[Array, "batch seq hidden"],
+        Optional[Bool[Array, "batch seq"]],
+        Optional[tuple[Float[Array, "..."], ...]],
+    ]:
+        """Embed text tokens and splice image embeddings at image positions."""
+        inputs_embeds = self.language_model.embed_tokens(input_ids)
+        if pixel_values is None or image_grid_thw is None:
+            return inputs_embeds, None, None
+
+        # Prefer mm_token_type_ids when supplied so this matches get_rope_index.
+        if mm_token_type_ids is not None:
+            image_mask = (mm_token_type_ids == 1)
+        else:
+            image_mask = (input_ids == self.config.image_token_id)
+
+        image_embeds, deepstack_image_embeds = self.get_image_features(
+            pixel_values, image_grid_thw
+        )
+        batch_size = input_ids.shape[0]
+        image_idx = jnp.cumsum(jnp.reshape(image_mask, [-1])) - 1
+        image_embeds_i = rearrange(
+            image_embeds[image_idx],
+            "(b seq) hidden -> b seq hidden",
+            b=batch_size,
+        )
+        inputs_embeds = jnp.where(image_mask[..., None], image_embeds_i, inputs_embeds)
+        return inputs_embeds, image_mask, deepstack_image_embeds
+
+    def _resolve_position_ids(
+        self,
+        input_ids: Int[Array, "batch seq"],
+        image_grid_thw: Optional[Int[Array, "num_images 3"]],
+        attention_mask: Optional[Float[Array, "batch seq"]],
+        mm_token_type_ids: Optional[Int[Array, "batch seq"]],
+        position_ids: Optional[Int[Array, "3 batch seq"]],
+        rope_deltas: Optional[Int[Array, "batch 1"]],
+        cache_position: Optional[Int[Array, ""]],
+    ) -> tuple[Int[Array, "3 batch seq"], Int[Array, "batch 1"], Int[Array, "batch 1"]]:
+        """Resolve 3D position IDs.
+
+        Returns (position_ids, prior_rope_deltas, new_rope_deltas). The two delta
+        terms are returned separately so the caller can thread/sum as needed.
+        """
+        batch_size = input_ids.shape[0]
+        if rope_deltas is None:
+            rope_deltas = jnp.zeros((batch_size, 1), dtype=jnp.int32)
+        new_rope_deltas = jnp.zeros((batch_size, 1), dtype=jnp.int32)
+        if position_ids is None:
+            position_ids, new_rope_deltas = self.get_rope_index(
+                input_ids, image_grid_thw, attention_mask, mm_token_type_ids
+            )
+            position_ids += rope_deltas
+            if cache_position is not None:
+                position_ids += cache_position
+        return position_ids, rope_deltas, new_rope_deltas
+
+    def _build_attention_mask(
+        self,
+        attention_mask: Optional[Float[Array, "batch seq"]],
+        cache: Optional[KVCache],
+        cache_position: Optional[Int[Array, ""]],
+        batch_size: int,
+        seq_len: int,
+    ) -> tuple[Bool[Array, "batch 1 seq kv_seq"], Bool[Array, "batch kv_seq"]]:
+        """Build the 4-D causal+padding mask and a 2-D kv_mask for varlen attention.
+
+        attention_mask defaults to all-ones when None — both downstream consumers
+        (causal mask and varlen kv_mask) require it.
+        """
+        if cache is not None:
+            kv_len = cache.max_seq_len
+            past_seen_tokens = cache_position if cache_position is not None else 0
+        else:
+            kv_len = seq_len
+            past_seen_tokens = 0
+
+        q_positions = jnp.arange(seq_len) + past_seen_tokens
+        k_positions = jnp.arange(kv_len)
+        causal_mask = (k_positions[None, :] <= q_positions[:, None])[None, None, :, :]
+
+        if attention_mask is None:
+            attention_mask = jnp.ones((batch_size, kv_len), dtype=jnp.int32)
+        elif attention_mask.shape[-1] < kv_len:
+            attention_mask = jnp.pad(
+                attention_mask,
+                ((0, 0), (0, kv_len - attention_mask.shape[-1])),
+                constant_values=1,
+            )
+
+        kv_mask = attention_mask[:, :kv_len].astype(jnp.bool)
+        causal_mask = causal_mask & kv_mask[:, None, None, :]
+        return causal_mask, kv_mask
+
     def __call__(
         self,
         input_ids: Int[Array, "batch seq"],
@@ -292,98 +392,24 @@ class Qwen3VLModel(eqx.Module):
     ) -> tuple[Float[Array, "batch seq hidden"], Optional[KVCache], Int[Array, "batch 1"]]:
         """Forward pass.
 
-        Args:
-            input_ids: Token IDs (batch, seq)
-            pixel_values: Image patches (if images present)
-            image_grid_thw: Grid dimensions for each image
-            attention_mask: Attention mask (batch, seq)
-            position_ids: Pre-computed position IDs (3, batch, seq)
-            cache: KV cache
-            cache_position: Position in cache
-            mm_token_type_ids: Per-token modality (0 text, 1 image, 2 video) from processor
-
         Returns:
             (hidden_states, new_cache, rope_deltas) tuple
         """
         batch_size, seq_len = input_ids.shape
 
-        # Get text embeddings
-        inputs_embeds = self.language_model.embed_tokens(input_ids)
+        inputs_embeds, visual_pos_masks, deepstack_visual_embeds = self._splice_image_embeds(
+            input_ids, pixel_values, image_grid_thw, mm_token_type_ids,
+        )
 
-        # Process images
-        image_mask = None
-        deepstack_visual_embeds = None
-        visual_pos_masks = None
+        position_ids, rope_deltas, new_rope_deltas = self._resolve_position_ids(
+            input_ids, image_grid_thw, attention_mask, mm_token_type_ids,
+            position_ids, rope_deltas, cache_position,
+        )
 
-        if pixel_values is not None and image_grid_thw is not None:
-            # Get image features
-            image_embeds, deepstack_image_embeds = self.get_image_features(
-                pixel_values, image_grid_thw
-            )
+        causal_mask, kv_mask = self._build_attention_mask(
+            attention_mask, cache, cache_position, batch_size, seq_len,
+        )
 
-            # Find image token positions
-            image_mask = input_ids == self.config.image_token_id
-            image_idx = jnp.cumsum(jnp.reshape(image_mask, [-1])) - 1
-            image_embeds_i = rearrange(image_embeds[image_idx],
-                "(b seq) hidden -> b seq hidden", b=batch_size
-            )
-
-            # Replace image tokens with image embeddings
-            # Note: This assumes image_embeds matches the number of image tokens
-            inputs_embeds = jnp.where(
-                image_mask[..., None],
-                image_embeds_i,
-                inputs_embeds
-            )
-
-            visual_pos_masks = image_mask
-            deepstack_visual_embeds = deepstack_image_embeds
-
-        # Compute position IDs if not provided
-        if rope_deltas is None:
-            rope_deltas = jnp.zeros((batch_size, 1), dtype=jnp.int32)
-        new_rope_deltas = jnp.zeros((batch_size, 1), dtype=jnp.int32)
-        if position_ids is None:
-            position_ids, new_rope_deltas = self.get_rope_index(
-                input_ids, image_grid_thw, attention_mask, mm_token_type_ids
-            )
-            position_ids += rope_deltas
-            if cache is not None:
-                position_ids += cache_position if cache_position is not None else 0
-
-        # Create causal attention mask (always needed for causal language modeling)
-        # attention_mask is a padding mask: (batch, seq) with 1 for valid tokens, 0 for padding
-        if cache is not None:
-            kv_len = cache.max_seq_len
-            # When using cache, need to account for cache position
-            past_seen_tokens = cache_position if cache_position is not None else 0
-        else:
-            kv_len = seq_len
-            past_seen_tokens = 0
-
-        # Create causal mask: can only attend to positions <= current position
-        # Shape: (seq, kv_seq)
-        q_positions = jnp.arange(seq_len) + past_seen_tokens
-        k_positions = jnp.arange(kv_len)
-        causal_mask = (k_positions[None, :] <= q_positions[:, None])
-        # Expand to (batch, 1, seq, kv_seq) for broadcasting
-        causal_mask = causal_mask[None, None, :, :]
-
-        # Apply padding mask if provided
-        # attention_mask: (batch, seq) with 1 for valid tokens, 0 for padding
-        if attention_mask is not None:
-            # Expand padding mask: (batch, seq) -> (batch, 1, 1, kv_seq)
-            # Mask out positions where attention_mask is 0 (padding)
-            if attention_mask.shape[-1] < kv_len:
-                attention_mask = jnp.pad(
-                    attention_mask,
-                    ((0, 0), (0, kv_len - attention_mask.shape[-1])),
-                    constant_values=1,
-                )
-            padding_mask = attention_mask[:, None, None, :kv_len].astype(jnp.bool)
-            causal_mask = causal_mask & padding_mask
-
-        # Forward through language model
         hidden_states, new_cache = self.language_model(
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
@@ -392,7 +418,7 @@ class Qwen3VLModel(eqx.Module):
             cache_position=cache_position,
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
-            kv_mask=attention_mask.astype(jnp.bool)
+            kv_mask=kv_mask,
         )
 
         return hidden_states, new_cache, (rope_deltas + new_rope_deltas)
