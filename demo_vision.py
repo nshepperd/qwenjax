@@ -1,5 +1,11 @@
 """Demo: vision understanding with Qwen3-VL in JAX."""
 
+import os
+
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "cuda_async"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.25"
+
+
 import argparse
 from pathlib import Path
 
@@ -81,6 +87,8 @@ def main():
         images=images,
         return_tensors="pt",
         padding=True,
+        padding_side='left',
+        pad_to_multiple_of=128,
     )
     inputs = {k: to_jax(v) for k, v in dict(inputs).items()}
 
