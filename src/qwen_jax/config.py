@@ -1,7 +1,7 @@
 """Pydantic configuration models for Qwen3-VL."""
 
 from pathlib import Path
-from pydantic import BaseModel, ConfigDict
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 from transformers import Qwen3VLConfig as HFQwen3VLConfig
 
 class Qwen3VLVisionConfig(BaseModel):
@@ -61,9 +61,29 @@ class Qwen3VLTextConfig(BaseModel):
     use_cache: bool = True
     tie_word_embeddings: bool = False
     rope_theta: float = 5000000.0
-    rope_scaling: RopeScalingConfig | None = None
+    rope_scaling: RopeScalingConfig | None = Field(
+        default=None,
+        validation_alias=AliasChoices("rope_parameters", "rope_scaling"),
+    )
     attention_bias: bool = False
     attention_dropout: float = 0.0
+
+    @model_validator(mode="before")
+    @classmethod
+    def _lift_rope_theta(cls, data):
+        # Newer checkpoints embed `rope_theta` inside `rope_parameters` instead of
+        # exposing it as a top-level field. Lift it out so the rest of the code
+        # can keep reading `config.rope_theta` directly.
+        if not isinstance(data, dict):
+            return data
+        if "rope_theta" in data:
+            return data
+        for key in ("rope_parameters", "rope_scaling"):
+            nested = data.get(key)
+            if isinstance(nested, dict) and "rope_theta" in nested:
+                data = {**data, "rope_theta": nested["rope_theta"]}
+                break
+        return data
 
 class QuantizationConfig(BaseModel):
     _load_in_4bit: bool

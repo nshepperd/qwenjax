@@ -24,7 +24,7 @@ def path_to_str(path: jax.tree_util.KeyPath) -> str:
 
 def load_qwen3_jax(model_path: str | Path, error_on_unused: bool = True) -> Qwen3VLForConditionalGeneration:
     model_path = Path(model_path)
-    model_conf = Qwen3VLConfig.from_pretrained(model_path)
+    model_conf = Qwen3VLConfig.from_pretrained(pretrained_model_name_or_path=model_path)
 
     state_dict = {}
     for filename in tqdm(model_path.glob("*.safetensors"), desc="Loading safetensors"):
