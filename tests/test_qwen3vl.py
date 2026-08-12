@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -23,6 +21,7 @@ import qwen_jax.testutil as tu
 from qwen_jax.cache import KVCache
 from qwen_jax.equinox_utils import mapmod_with_path
 from qwen_jax.model import Qwen3VLForConditionalGeneration
+from qwen_jax.param import params_with_paths, path_to_key
 from qwen_jax.testutil import to_jax
 from qwen_jax.utils.pjit import pjit
 
@@ -112,13 +111,32 @@ def large_image_inputs():
 def test_loaded_models(hf_model: HFModel, jax_model: Qwen3VLForConditionalGeneration):
     hf_params = hf_model.state_dict()
 
-    def visit(path: jax.tree_util.KeyPath, leaf: Any):
-        str_path = jax.tree_util.keystr(path, simple=True, separator=".")
-        if isinstance(leaf, Array) and str_path in hf_params:
-            np.testing.assert_allclose(leaf, hf_params[str_path].detach().cpu().numpy())
-        return leaf
+    # Every Param is named by its tree path, which is its state dict key. Check
+    # the correspondence in both directions: comparing only where the names
+    # happen to line up would pass just as well if nothing lined up at all.
+    checked = set()
+    for path, param in params_with_paths(jax_model):
+        key = path_to_key(path)
+        assert key in hf_params, f"Loaded param has no counterpart in HF: {key}"
+        np.testing.assert_allclose(
+            param(), hf_params[key].detach().cpu().numpy(), err_msg=key
+        )
+        checked.add(key)
 
-    jax.tree_util.tree_map_with_path(visit, jax_model)
+    unchecked = set(hf_params) - checked
+    if jax_model.config.tie_word_embeddings:
+        # torch materialises the tied output projection in state_dict(); the JAX
+        # model has no Param for it and resolves it from embed_tokens instead,
+        # so check the tie actually holds rather than just excusing the absence.
+        tied = unchecked & {"lm_head.weight"}
+        for key in tied:
+            np.testing.assert_allclose(
+                jax_model.get_lm_head().weight(),
+                hf_params[key].detach().cpu().numpy(),
+                err_msg=key,
+            )
+        unchecked -= tied
+    assert not unchecked, f"HF weights not present in the JAX model: {sorted(unchecked)}"
 
 
 def test_vision(hf_model: HFModel, jax_model: Qwen3VLForConditionalGeneration):

@@ -9,7 +9,6 @@ from jaxtyping import Array, Bool, Float, Int
 
 from qwen_jax.config import Qwen3VLTextConfig
 
-from . import equinox_utils as eu
 from .attention import Qwen3VLTextAttention
 from .cache import KVCache, KVCacheLayer
 from .linear import Embedding, RMSNorm
@@ -41,19 +40,6 @@ class Qwen3VLTextDecoderLayer(eqx.Module):
         )
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = Qwen3VLTextMLP(config.hidden_size, config.intermediate_size)
-
-    def load_state_dict(self, state_dict: dict[str, jax.Array], prefix: str):
-        return eu.replace(
-            self,
-            input_layernorm=self.input_layernorm.load_state_dict(
-                state_dict, prefix + "input_layernorm."
-            ),
-            self_attn=self.self_attn.load_state_dict(state_dict, prefix + "self_attn."),
-            post_attention_layernorm=self.post_attention_layernorm.load_state_dict(
-                state_dict, prefix + "post_attention_layernorm."
-            ),
-            mlp=self.mlp.load_state_dict(state_dict, prefix + "mlp."),
-        )
 
     @jax.remat
     def __call__(
@@ -134,18 +120,6 @@ class Qwen3VLTextModel(eqx.Module):
             config=self.config,
         )
 
-    def load_state_dict(self, state_dict: dict[str, jax.Array], prefix: str = ""):
-        return eu.replace(
-            self,
-            embed_tokens=self.embed_tokens.load_state_dict(state_dict, prefix + "embed_tokens."),
-            layers=tuple(
-                self.layers[i].load_state_dict(state_dict, prefix + f"layers.{i}.")
-                for i in range(len(self.layers))
-            ),
-            norm=self.norm.load_state_dict(state_dict, prefix + "norm."),
-            # rotary emb has no parameters
-        )
-
     def _deepstack_process(
         self,
         hidden_states: Float[Array, "batch seq hidden"],
@@ -221,7 +195,7 @@ class Qwen3VLTextModel(eqx.Module):
 
         # Compute position embeddings (MRoPE)
         position_embeddings = self.rotary_emb(position_ids)
-        position_embeddings = jax.tree.map(lambda x: x.astype(self.embed_tokens.weight.dtype), position_embeddings)
+        position_embeddings = jax.tree.map(lambda x: x.astype(self.embed_tokens.weight().dtype), position_embeddings)
 
         hidden_states = inputs_embeds
 

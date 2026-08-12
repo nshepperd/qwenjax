@@ -76,13 +76,6 @@ class Qwen3VLModel(eqx.Module):
             config.text_config,
         )
 
-    def load_state_dict(self, state_dict: dict[str, jax.Array], prefix: str = ""):
-        return eu.replace(
-            self,
-            visual=self.visual.load_state_dict(state_dict, prefix + "visual."),
-            language_model=self.language_model.load_state_dict(state_dict, prefix + "language_model."),
-        )
-
     def get_input_embeddings(self) -> Embedding:
         return self.language_model.embed_tokens
 
@@ -443,7 +436,8 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
     # Models
     model: Qwen3VLModel
 
-    _lm_head: Linear | None
+    # None when weights are tied; get_lm_head() resolves that.
+    lm_head: Linear | None
 
     def __init__(
         self,
@@ -457,23 +451,12 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
 
         self.model = Qwen3VLModel(config)
         if config.tie_word_embeddings:
-            self._lm_head = None
+            self.lm_head = None
         else:
-            self._lm_head = Linear(self.model.language_model.config.hidden_size, self.vocab_size, use_bias=False)
+            self.lm_head = Linear(self.model.language_model.config.hidden_size, self.vocab_size, use_bias=False)
 
-    def load_state_dict(self, state_dict: dict[str, jax.Array], prefix: str = ""):
-        lm_head = None
-        if not self.config.tie_word_embeddings:
-            assert self._lm_head is not None
-            lm_head = self._lm_head.load_state_dict(state_dict, prefix + "lm_head.")
-        return eu.replace(
-            self,
-            model=self.model.load_state_dict(state_dict, prefix + "model."),
-            _lm_head=lm_head,
-        )
-
-    @property
-    def lm_head(self) -> Linear:
+    def get_lm_head(self) -> Linear:
+        """The output projection, borrowing the input embedding when tied."""
         if self.config.tie_word_embeddings:
             # weight is [out_features, in_features] == [vocab, dim] same as embed
             return eu.replace(
@@ -483,10 +466,11 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
                     use_bias=False,
                 ),
                 weight=self.model.language_model.embed_tokens.weight,
+                bias=None,
             )
         else:
-            assert self._lm_head is not None
-            return self._lm_head
+            assert self.lm_head is not None
+            return self.lm_head
 
     @pjit(static_argnames=("use_cache", "last_logit_only"))
     def __call__(
@@ -518,7 +502,7 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
             batch_size = input_ids.shape[0]
             max_seq_len = input_ids.shape[1]
             text_config = self.model.config.text_config
-            cache_dtype = self.model.language_model.embed_tokens.weight.dtype
+            cache_dtype = self.model.language_model.embed_tokens.weight().dtype
             if cache_dtype == jnp.float32:
                 cache_dtype = jnp.bfloat16
             cache = KVCache.create(
@@ -554,7 +538,7 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
             else:
                 last_idx = jnp.full((batch_size,), seq_len - 1, dtype=jnp.int32)
             last_hidden = gather('b s h, b [s] -> b h', hidden_states, last_idx)
-            last_logits = self.lm_head(last_hidden)
+            last_logits = self.get_lm_head()(last_hidden)
             return Qwen3VLOutput(
                 logits=None,
                 hidden_states=hidden_states,
@@ -563,7 +547,7 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
                 last_logits=last_logits,
             )
 
-        logits = self.lm_head(hidden_states)
+        logits = self.get_lm_head()(hidden_states)
         return Qwen3VLOutput(
             logits=logits,
             hidden_states=hidden_states,
@@ -740,4 +724,4 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
         return Qwen3VLGenerateOutput(tokens=all_tokens, cache=final_cache, logits=all_logits)
 
 
-__all__ = ["Qwen3VLModel", "Qwen3VLForConditionalGeneration", "Qwen3VLOutput"]
+__all__ = ["Qwen3VLForConditionalGeneration", "Qwen3VLModel", "Qwen3VLOutput"]

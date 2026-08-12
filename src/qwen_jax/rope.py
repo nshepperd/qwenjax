@@ -6,8 +6,6 @@ Contains:
 """
 from __future__ import annotations
 
-from typing import Annotated
-
 import equinox as eqx
 import jax.numpy as jnp
 from einops.einops import rearrange
@@ -15,15 +13,14 @@ from jaxtyping import Array, Float, Int
 
 from qwen_jax.config import Qwen3VLTextConfig
 
-from .utils.buffer import Buffer
-
 
 class Qwen3VLVisionRotaryEmbedding(eqx.Module):
     """Simple 1D Rotary Position Embedding for vision transformer.
 
     Computes frequency table that can be indexed by position.
     """
-    inv_freq: Annotated[Float[Array, "dim_half"], Buffer(persistent=False)]
+    # Derived from config, not loaded: a bare Array rather than a Param.
+    inv_freq: Float[Array, "dim_half"]
     theta: float = eqx.field(static=True)
     dim: int = eqx.field(static=True)
 
@@ -104,7 +101,8 @@ class Qwen3VLTextRotaryEmbedding(eqx.Module):
 
     The frequencies are interleaved in the pattern [T, H, W, T, H, W, ...]
     """
-    inv_freq: Annotated[Float[Array, "head_dim_half"], Buffer(persistent=False)]
+    # Derived from config, not loaded: a bare Array rather than a Param.
+    inv_freq: Float[Array, "head_dim_half"]
     mrope_section: tuple[int, int, int] = eqx.field(static=True)
     attention_scaling: float = eqx.field(static=True)
     head_dim: int = eqx.field(static=True)
@@ -224,9 +222,9 @@ def apply_rotary_pos_emb(
 
 
 __all__ = [
-    "Qwen3VLVisionRotaryEmbedding",
     "Qwen3VLTextRotaryEmbedding",
-    "apply_rotary_pos_emb_vision",
+    "Qwen3VLVisionRotaryEmbedding",
     "apply_rotary_pos_emb",
+    "apply_rotary_pos_emb_vision",
     "rotate_half",
 ]

@@ -15,6 +15,7 @@ from . import equinox_utils as eu
 from .attention import Qwen3VLVisionAttention
 from .linear import Embedding, LayerNorm, Linear
 from .mlp import Qwen3VLVisionMLP
+from .param import Param
 from .rope import Qwen3VLVisionRotaryEmbedding
 
 
@@ -22,8 +23,8 @@ class PatchEmbedProj(eqx.Module):
     """This is effectively a Conv3d except we don't actually need a conv
     because the stride is equal to the kernel size. And the input is already
     reshaped to separate patches."""
-    weight: Float[Array, "out_channels in_channels kernel_t kernel_h kernel_w"] | None
-    bias: Float[Array, "out_channels"] | None
+    weight: Param
+    bias: Param
     in_channels: int = eqx.field(static=True)
     out_channels: int = eqx.field(static=True)
     kernel_size: tuple[int, int, int] = eqx.field(static=True)
@@ -35,45 +36,26 @@ class PatchEmbedProj(eqx.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.kernel_size = kernel_size
-        self.weight = None
-        self.bias = None
+        self.weight = Param(out_channels, in_channels, *kernel_size)
+        self.bias = Param(out_channels)
 
     def init_weights(self, key: PRNGKeyArray):
         kt, kh, kw = self.kernel_size
-        weight = jax.random.normal(
-            key, (self.out_channels, self.in_channels, kt, kh, kw)
-        ) / np.sqrt(self.in_channels * kt * kh * kw)
-        bias = jnp.zeros((self.out_channels,))
-        return eu.replace(self, weight=weight, bias=bias)
-
-    def load_state_dict(self, state_dict: dict[str, jax.Array], prefix: str):
-        """Load state dict into module."""
-        weight_shape = (
-            self.out_channels,
-            self.in_channels,
-            self.kernel_size[0],
-            self.kernel_size[1],
-            self.kernel_size[2],
+        weight = self.weight.set(
+            jax.random.normal(key, self.weight.shape)
+            / np.sqrt(self.in_channels * kt * kh * kw)
         )
-        weight = state_dict.pop(prefix + "weight")
-
-        assert weight.shape == weight_shape, \
-            f"Weight shape mismatch: expected {weight_shape}, got {weight.shape}"
-        bias = state_dict.pop(prefix + "bias")
-        assert bias.shape == (self.out_channels,), \
-            f"Bias shape mismatch: expected {(self.out_channels,)}, got {bias.shape}"
+        bias = self.bias.set(jnp.zeros(self.bias.shape))
         return eu.replace(self, weight=weight, bias=bias)
-
 
     def __call__(
         self,
         hidden_states: Float[Array, "total_patches in_channels temporal patch patch"],
     ) -> Float[Array, "total_patches out_channels"]:
-        assert self.weight is not None and self.bias is not None, "Weights are not initialized."
         hidden_states = jnp.einsum(
-            'bctpq,octpq->bo', hidden_states, self.weight
+            'bctpq,octpq->bo', hidden_states, self.weight()
         )
-        hidden_states += self.bias  # (total_patches, out_channels)
+        hidden_states += self.bias()  # (total_patches, out_channels)
         return hidden_states
 
 class Qwen3VLVisionPatchEmbed(eqx.Module):
@@ -102,11 +84,6 @@ class Qwen3VLVisionPatchEmbed(eqx.Module):
         self.proj = PatchEmbedProj(
             self.in_channels, self.embed_dim, kernel_size
         )
-
-    def load_state_dict(self, state_dict: dict[str, jax.Array], prefix: str):
-        """Load state dict into module."""
-        proj = self.proj.load_state_dict(state_dict, prefix + "proj.")
-        return eu.replace(self, proj=proj)
 
     def __call__(
         self,
@@ -158,14 +135,6 @@ class Qwen3VLVisionPatchMerger(eqx.Module):
 
         self.linear_fc1 = Linear(merged_hidden, merged_hidden, use_bias=True)
         self.linear_fc2 = Linear(merged_hidden, config.out_hidden_size, use_bias=True)
-
-    def load_state_dict(self, state_dict: dict[str, jax.Array], prefix: str):
-        return eu.replace(
-            self,
-            norm=self.norm.load_state_dict(state_dict, prefix + "norm."),
-            linear_fc1=self.linear_fc1.load_state_dict(state_dict, prefix + "linear_fc1."),
-            linear_fc2=self.linear_fc2.load_state_dict(state_dict, prefix + "linear_fc2."),
-        )
 
     def __call__(
         self,
@@ -221,15 +190,6 @@ class Qwen3VLVisionBlock(eqx.Module):
         self.norm2 = LayerNorm(hidden_size, eps=1e-6)
         self.attn = Qwen3VLVisionAttention(hidden_size, num_heads)
         self.mlp = Qwen3VLVisionMLP(hidden_size, intermediate_size)
-
-    def load_state_dict(self, state_dict: dict[str, jax.Array], prefix: str):
-        return eu.replace(
-            self,
-            norm1 = self.norm1.load_state_dict(state_dict, prefix + "norm1."),
-            norm2 = self.norm2.load_state_dict(state_dict, prefix + "norm2."),
-            attn = self.attn.load_state_dict(state_dict, prefix + "attn."),
-            mlp = self.mlp.load_state_dict(state_dict, prefix + "mlp.")
-        )
 
     def __call__(
         self,
@@ -324,25 +284,6 @@ class Qwen3VLVisionModel(eqx.Module):
             ))
         self.deepstack_merger_list = tuple(deepstack_mergers)
 
-    def load_state_dict(self, state_dict: dict[str, jax.Array], prefix: str = ""):
-        return eu.replace(
-            self,
-            patch_embed=self.patch_embed.load_state_dict(state_dict, prefix + "patch_embed."),
-            pos_embed=self.pos_embed.load_state_dict(state_dict, prefix + "pos_embed."),
-            # rotary emb has no parameters
-            blocks=tuple(
-                self.blocks[i].load_state_dict(state_dict, prefix + f"blocks.{i}.")
-                for i in range(len(self.blocks))
-            ),
-            merger=self.merger.load_state_dict(state_dict, prefix + "merger."),
-            deepstack_merger_list=tuple(
-                self.deepstack_merger_list[i].load_state_dict(
-                    state_dict, prefix + f"deepstack_merger_list.{i}."
-                )
-                for i in range(len(self.deepstack_merger_list))
-            ),
-        )
-
     def rot_pos_emb(
         self,
         grid_thw: Int[Array, "num_images 3"],
@@ -406,11 +347,10 @@ class Qwen3VLVisionModel(eqx.Module):
         patch_idx = jnp.arange(total_patches) - fenceposts[patch_image]
         # index within each image's patches
 
-        assert self.pos_embed.weight is not None
         interp = RegularGridInterpolator(
             (jnp.linspace(0, 1, num_grid_per_side),
              jnp.linspace(0, 1, num_grid_per_side)),
-            self.pos_embed.weight.reshape(num_grid_per_side, num_grid_per_side, -1),
+            self.pos_embed.weight().reshape(num_grid_per_side, num_grid_per_side, -1),
             method="linear",
         )
 
@@ -482,8 +422,8 @@ class Qwen3VLVisionModel(eqx.Module):
 
 
 __all__ = [
-    "Qwen3VLVisionPatchEmbed",
-    "Qwen3VLVisionPatchMerger",
     "Qwen3VLVisionBlock",
     "Qwen3VLVisionModel",
+    "Qwen3VLVisionPatchEmbed",
+    "Qwen3VLVisionPatchMerger",
 ]

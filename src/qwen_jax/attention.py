@@ -10,7 +10,6 @@ from jaxtyping import Array, Bool, Float, Int
 
 from qwen_jax.config import Qwen3VLTextConfig
 
-from . import equinox_utils as eu
 from .cache import KVCacheLayer
 from .linear import Linear, RMSNorm
 from .rope import apply_rotary_pos_emb, apply_rotary_pos_emb_vision
@@ -42,12 +41,6 @@ class Qwen3VLVisionAttention(eqx.Module):
         # Fused QKV: projects to 3 * hidden_size
         self.qkv = Linear(hidden_size, hidden_size * 3, use_bias=True)
         self.proj = Linear(hidden_size, hidden_size, use_bias=True)
-
-    def load_state_dict(self, state_dict: dict[str, jax.Array], prefix: str):
-        """Load state dict into module."""
-        qkv = self.qkv.load_state_dict(state_dict, prefix + "qkv.")
-        proj = self.proj.load_state_dict(state_dict, prefix + "proj.")
-        return eu.replace(self, qkv=qkv, proj=proj)
 
     def __call__(
         self,
@@ -176,18 +169,6 @@ class Qwen3VLTextAttention(eqx.Module):
         self.q_norm = RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(config.head_dim, eps=config.rms_norm_eps)
 
-    def load_state_dict(self, state_dict: dict[str, jax.Array], prefix: str):
-        """Load state dict into module."""
-        return eu.replace(
-            self,
-            q_proj=self.q_proj.load_state_dict(state_dict, prefix + "q_proj."),
-            k_proj=self.k_proj.load_state_dict(state_dict, prefix + "k_proj."),
-            v_proj=self.v_proj.load_state_dict(state_dict, prefix + "v_proj."),
-            o_proj=self.o_proj.load_state_dict(state_dict, prefix + "o_proj."),
-            q_norm=self.q_norm.load_state_dict(state_dict, prefix + "q_norm."),
-            k_norm=self.k_norm.load_state_dict(state_dict, prefix + "k_norm."),
-        )
-
     @jax.remat
     def __call__(
         self,
@@ -313,4 +294,4 @@ class Qwen3VLTextAttention(eqx.Module):
         return output, new_cache
 
 
-__all__ = ["Qwen3VLVisionAttention", "Qwen3VLTextAttention"]
+__all__ = ["Qwen3VLTextAttention", "Qwen3VLVisionAttention"]

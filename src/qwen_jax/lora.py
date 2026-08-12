@@ -17,6 +17,7 @@ from pydantic.main import BaseModel
 from . import equinox_utils as eu
 from .linear import Linear
 from .linear4bit import Linear4bit
+from .param import Param
 
 
 class LoraConfig(BaseModel):
@@ -88,16 +89,14 @@ def apply_adapters(module: T, adapters: Sequence[LoraAdapter]) -> T:
             lora_A=eu.new(Linear,
                 in_features=lora_A.shape[1],
                 out_features=r_total,
-                weight=lora_A,
+                weight=Param(*lora_A.shape, array=lora_A),
                 bias=None,
-                use_bias=False,
             ),
             lora_B=eu.new(Linear,
                 in_features=r_total,
                 out_features=lora_B.shape[0],
-                weight=lora_B,
+                weight=Param(*lora_B.shape, array=lora_B),
                 bias=None,
-                use_bias=False,
             ),
             alpha=merged_alpha_on_r,
             r=r_total,
