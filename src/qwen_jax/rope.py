@@ -4,17 +4,18 @@ Contains:
 - Qwen3VLVisionRotaryEmbedding: Simple 1D RoPE for vision attention
 - Qwen3VLTextRotaryEmbedding: Multimodal RoPE (MRoPE) with 3D positions
 """
-from qwen_jax.config import Qwen3VLTextConfig
-from einops.einops import rearrange
-from .utils.buffer import Buffer
+from __future__ import annotations
+
 from typing import Annotated
-from dataclasses import field
+
 import equinox as eqx
-import jax
 import jax.numpy as jnp
+from einops.einops import rearrange
 from jaxtyping import Array, Float, Int
 
-from . import equinox_utils as eu
+from qwen_jax.config import Qwen3VLTextConfig
+
+from .utils.buffer import Buffer
 
 
 class Qwen3VLVisionRotaryEmbedding(eqx.Module):
@@ -23,8 +24,8 @@ class Qwen3VLVisionRotaryEmbedding(eqx.Module):
     Computes frequency table that can be indexed by position.
     """
     inv_freq: Annotated[Float[Array, "dim_half"], Buffer(persistent=False)]
-    theta: float = field(metadata=dict(static=True))
-    dim: int = field(metadata=dict(static=True))
+    theta: float = eqx.field(static=True)
+    dim: int = eqx.field(static=True)
 
     def __init__(self, dim: int, theta: float = 10000.0):
         self.dim = dim
@@ -104,9 +105,9 @@ class Qwen3VLTextRotaryEmbedding(eqx.Module):
     The frequencies are interleaved in the pattern [T, H, W, T, H, W, ...]
     """
     inv_freq: Annotated[Float[Array, "head_dim_half"], Buffer(persistent=False)]
-    mrope_section: tuple[int, int, int] = field(metadata=dict(static=True))
-    attention_scaling: float = field(metadata=dict(static=True))
-    head_dim: int = field(metadata=dict(static=True))
+    mrope_section: tuple[int, int, int] = eqx.field(static=True)
+    attention_scaling: float = eqx.field(static=True)
+    head_dim: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -172,9 +173,7 @@ class Qwen3VLTextRotaryEmbedding(eqx.Module):
                 (3, position_ids.shape[0], position_ids.shape[1])
             )
 
-        # Shape: (3, batch, seq)
-        batch_size = position_ids.shape[1]
-        seq_len = position_ids.shape[2]
+        # position_ids shape: (3, batch, seq)
 
         # Compute frequencies for each dimension
         # inv_freq: (head_dim // 2,)

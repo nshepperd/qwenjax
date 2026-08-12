@@ -2,12 +2,13 @@
 
 Contains Linear, Embedding, LayerNorm (ported from llama_jax) and RMSNorm.
 """
-from dataclasses import field
+from __future__ import annotations
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float, PRNGKeyArray
 import numpy as np
+from jaxtyping import Array, PRNGKeyArray
 
 from . import equinox_utils as eu
 
@@ -59,8 +60,8 @@ class Linear(eqx.Module):
 
 class Embedding(eqx.Module):
     weight: jax.Array | None
-    num_embeddings: int = field(metadata=dict(static=True))
-    embedding_dim: int = field(metadata=dict(static=True))
+    num_embeddings: int = eqx.field(static=True)
+    embedding_dim: int = eqx.field(static=True)
 
     def __init__(self, num_embeddings: int, embedding_dim: int):
         self.num_embeddings = num_embeddings
@@ -89,7 +90,7 @@ class Embedding(eqx.Module):
 class LayerNorm(eqx.Module):
     weight: jax.Array
     bias: jax.Array
-    eps: float = field(metadata=dict(static=True))
+    eps: float = eqx.field(static=True)
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         self.weight = jnp.ones((hidden_size,))
@@ -120,7 +121,7 @@ class LayerNorm(eqx.Module):
 class RMSNorm(eqx.Module):
     """RMSNorm layer for Qwen3-VL text model."""
     weight: jax.Array
-    variance_epsilon: float = field(metadata=dict(static=True))
+    variance_epsilon: float = eqx.field(static=True)
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         self.weight = jnp.ones((hidden_size,))

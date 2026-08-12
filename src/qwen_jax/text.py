@@ -1,28 +1,26 @@
 """Text model components for Qwen3-VL."""
-from qwen_jax.config import Qwen3VLTextConfig
-from einops import rearrange
-from dataclasses import field
-from typing import Optional
+from __future__ import annotations
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
+from einops import rearrange
+from jaxtyping import Array, Bool, Float, Int
+
+from qwen_jax.config import Qwen3VLTextConfig
 
 from . import equinox_utils as eu
-from .cache import KVCache, KVCacheLayer
-from .utils.rng import split
-
 from .attention import Qwen3VLTextAttention
-from .linear import Embedding, Linear, RMSNorm
+from .cache import KVCache, KVCacheLayer
+from .linear import Embedding, RMSNorm
 from .mlp import Qwen3VLTextMLP
 from .rope import Qwen3VLTextRotaryEmbedding
 
 
 class Qwen3VLTextDecoderLayer(eqx.Module):
     """Qwen3-VL text decoder layer with pre-norm."""
-    hidden_size: int = field(metadata=dict(static=True))
-    layer_idx: int = field(metadata=dict(static=True))
+    hidden_size: int = eqx.field(static=True)
+    layer_idx: int = eqx.field(static=True)
 
     input_layernorm: RMSNorm
     self_attn: Qwen3VLTextAttention
@@ -62,11 +60,11 @@ class Qwen3VLTextDecoderLayer(eqx.Module):
         self,
         hidden_states: Float[Array, "batch seq hidden"],
         position_embeddings: tuple[Float[Array, "batch seq head_dim"], Float[Array, "batch seq head_dim"]],
-        attention_mask: Optional[Float[Array, "batch 1 seq kv_seq"]] = None,
-        cache: Optional[KVCacheLayer] = None,
-        cache_position: Optional[Int[Array, ""]] = None,
-        kv_mask: Optional[Bool[Array, "batch kv_seq"]] = None,
-    ) -> tuple[Float[Array, "batch seq hidden"], Optional[KVCacheLayer]]:
+        attention_mask: Float[Array, "batch 1 seq kv_seq"] | None = None,
+        cache: KVCacheLayer | None = None,
+        cache_position: Int[Array, ""] | None = None,
+        kv_mask: Bool[Array, "batch kv_seq"] | None = None,
+    ) -> tuple[Float[Array, "batch seq hidden"], KVCacheLayer | None]:
         """Forward pass.
 
         Args:
@@ -108,7 +106,7 @@ class Qwen3VLTextModel(eqx.Module):
     into early layers of the text model.
     """
     # Config
-    config: Qwen3VLTextConfig = field(metadata=dict(static=True))
+    config: Qwen3VLTextConfig = eqx.field(static=True)
 
     # Layers
     embed_tokens: Embedding
@@ -182,16 +180,16 @@ class Qwen3VLTextModel(eqx.Module):
     # @jax.remat
     def __call__(
         self,
-        input_ids: Optional[Int[Array, "batch seq"]] = None,
-        inputs_embeds: Optional[Float[Array, "batch seq hidden"]] = None,
-        position_ids: Optional[Int[Array, "3 batch seq"]] = None,
-        attention_mask: Optional[Float[Array, "batch 1 seq kv_seq"]] = None,
-        cache: Optional[KVCache] = None,
-        cache_position: Optional[Int[Array, ""]] = None,
-        visual_pos_masks: Optional[Float[Array, "batch seq"]] = None,
-        deepstack_visual_embeds: Optional[tuple[Float[Array, "..."], ...]] = None,
-        kv_mask: Optional[Bool[Array, "batch kv_seq"]] = None,
-    ) -> tuple[Float[Array, "batch seq hidden"], Optional[KVCache]]:
+        input_ids: Int[Array, "batch seq"] | None = None,
+        inputs_embeds: Float[Array, "batch seq hidden"] | None = None,
+        position_ids: Int[Array, "3 batch seq"] | None = None,
+        attention_mask: Float[Array, "batch 1 seq kv_seq"] | None = None,
+        cache: KVCache | None = None,
+        cache_position: Int[Array, ""] | None = None,
+        visual_pos_masks: Float[Array, "batch seq"] | None = None,
+        deepstack_visual_embeds: tuple[Float[Array, "..."], ...] | None = None,
+        kv_mask: Bool[Array, "batch kv_seq"] | None = None,
+    ) -> tuple[Float[Array, "batch seq hidden"], KVCache | None]:
         """Forward pass.
 
         Args:

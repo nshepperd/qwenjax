@@ -1,7 +1,7 @@
 """Qwen3-VL model implementation in JAX/Equinox."""
-from .utils.pjit import pjit
-from dataclasses import dataclass, field
-from typing import Optional
+from __future__ import annotations
+
+from dataclasses import dataclass
 
 import equinox as eqx
 import jax
@@ -11,15 +11,14 @@ from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 from transformers import Qwen3VLConfig
 
 from . import equinox_utils as eu
-from .utils.indexing import gather
 from .cache import KVCache
-from .utils.rng import split
-
 from .config import (
     Qwen3VLConfig as Qwen3VLConfigModel,
 )
 from .linear import Embedding, Linear
 from .text import Qwen3VLTextModel
+from .utils.indexing import gather
+from .utils.pjit import pjit
 from .vision import Qwen3VLVisionModel
 
 
@@ -34,11 +33,11 @@ class Qwen3VLOutput:
     prompt. Otherwise ``logits`` holds the full ``(batch, seq, vocab)`` tensor
     and ``last_logits`` is None.
     """
-    logits: Optional[Float[Array, "batch seq vocab"]]
+    logits: Float[Array, "batch seq vocab"] | None
     hidden_states: Float[Array, "batch seq hidden"]
     rope_deltas: Int[Array, "batch 1"]
-    cache: Optional[KVCache] = None
-    last_logits: Optional[Float[Array, "batch vocab"]] = None
+    cache: KVCache | None = None
+    last_logits: Float[Array, "batch vocab"] | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -46,8 +45,8 @@ class Qwen3VLOutput:
 class Qwen3VLGenerateOutput:
     """Output from Qwen3VL generate method."""
     tokens: Int[Array, "batch seq"]
-    cache: Optional[KVCache] = None
-    logits: Optional[Float[Array, "batch seq vocab"]] = None
+    cache: KVCache | None = None
+    logits: Float[Array, "batch seq vocab"] | None = None
 
 class Qwen3VLModel(eqx.Module):
     """Qwen3-VL multimodal model.
@@ -57,7 +56,7 @@ class Qwen3VLModel(eqx.Module):
     intermediate vision features into early text layers.
     """
     # Config
-    config: Qwen3VLConfigModel = field(metadata=dict(static=True))
+    config: Qwen3VLConfigModel = eqx.field(static=True)
 
     # Models
     visual: Qwen3VLVisionModel
@@ -107,9 +106,9 @@ class Qwen3VLModel(eqx.Module):
     def get_rope_index(
         self,
         input_ids: Int[Array, "batch seq"],
-        image_grid_thw: Optional[Int[Array, "num_images 3"]] = None,
-        attention_mask: Optional[Float[Array, "batch seq"]] = None,
-        mm_token_type_ids: Optional[Int[Array, "batch seq"]] = None,
+        image_grid_thw: Int[Array, "num_images 3"] | None = None,
+        attention_mask: Float[Array, "batch seq"] | None = None,
+        mm_token_type_ids: Int[Array, "batch seq"] | None = None,
     ) -> tuple[Int[Array, "3 batch seq"], Int[Array, "batch 1"]]:
         """Compute 3D position IDs for MRoPE (JIT-compatible).
 
@@ -289,13 +288,13 @@ class Qwen3VLModel(eqx.Module):
     def _splice_image_embeds(
         self,
         input_ids: Int[Array, "batch seq"],
-        pixel_values: Optional[Float[Array, "total_patches C*T*H*W"]],
-        image_grid_thw: Optional[Int[Array, "num_images 3"]],
-        mm_token_type_ids: Optional[Int[Array, "batch seq"]],
+        pixel_values: Float[Array, "total_patches C*T*H*W"] | None,
+        image_grid_thw: Int[Array, "num_images 3"] | None,
+        mm_token_type_ids: Int[Array, "batch seq"] | None,
     ) -> tuple[
         Float[Array, "batch seq hidden"],
-        Optional[Bool[Array, "batch seq"]],
-        Optional[tuple[Float[Array, "..."], ...]],
+        Bool[Array, "batch seq"] | None,
+        tuple[Float[Array, "..."], ...] | None,
     ]:
         """Embed text tokens and splice image embeddings at image positions."""
         inputs_embeds = self.language_model.embed_tokens(input_ids)
@@ -324,12 +323,12 @@ class Qwen3VLModel(eqx.Module):
     def _resolve_position_ids(
         self,
         input_ids: Int[Array, "batch seq"],
-        image_grid_thw: Optional[Int[Array, "num_images 3"]],
-        attention_mask: Optional[Float[Array, "batch seq"]],
-        mm_token_type_ids: Optional[Int[Array, "batch seq"]],
-        position_ids: Optional[Int[Array, "3 batch seq"]],
-        rope_deltas: Optional[Int[Array, "batch 1"]],
-        cache_position: Optional[Int[Array, ""]],
+        image_grid_thw: Int[Array, "num_images 3"] | None,
+        attention_mask: Float[Array, "batch seq"] | None,
+        mm_token_type_ids: Int[Array, "batch seq"] | None,
+        position_ids: Int[Array, "3 batch seq"] | None,
+        rope_deltas: Int[Array, "batch 1"] | None,
+        cache_position: Int[Array, ""] | None,
     ) -> tuple[Int[Array, "3 batch seq"], Int[Array, "batch 1"], Int[Array, "batch 1"]]:
         """Resolve 3D position IDs.
 
@@ -351,9 +350,9 @@ class Qwen3VLModel(eqx.Module):
 
     def _build_attention_mask(
         self,
-        attention_mask: Optional[Float[Array, "batch seq"]],
-        cache: Optional[KVCache],
-        cache_position: Optional[Int[Array, ""]],
+        attention_mask: Float[Array, "batch seq"] | None,
+        cache: KVCache | None,
+        cache_position: Int[Array, ""] | None,
         batch_size: int,
         seq_len: int,
     ) -> tuple[Bool[Array, "batch 1 seq kv_seq"], Bool[Array, "batch kv_seq"]]:
@@ -389,15 +388,15 @@ class Qwen3VLModel(eqx.Module):
     def __call__(
         self,
         input_ids: Int[Array, "batch seq"],
-        pixel_values: Optional[Float[Array, "total_patches C*T*H*W"]] = None,
-        image_grid_thw: Optional[Int[Array, "num_images 3"]] = None,
-        attention_mask: Optional[Float[Array, "batch seq"]] = None,
-        position_ids: Optional[Int[Array, "3 batch seq"]] = None,
-        cache: Optional[KVCache] = None,
-        cache_position: Optional[Int[Array, ""]] = None,
-        rope_deltas: Optional[Int[Array, "batch 1"]] = None,
-        mm_token_type_ids: Optional[Int[Array, "batch seq"]] = None,
-    ) -> tuple[Float[Array, "batch seq hidden"], Optional[KVCache], Int[Array, "batch 1"]]:
+        pixel_values: Float[Array, "total_patches C*T*H*W"] | None = None,
+        image_grid_thw: Int[Array, "num_images 3"] | None = None,
+        attention_mask: Float[Array, "batch seq"] | None = None,
+        position_ids: Int[Array, "3 batch seq"] | None = None,
+        cache: KVCache | None = None,
+        cache_position: Int[Array, ""] | None = None,
+        rope_deltas: Int[Array, "batch 1"] | None = None,
+        mm_token_type_ids: Int[Array, "batch seq"] | None = None,
+    ) -> tuple[Float[Array, "batch seq hidden"], KVCache | None, Int[Array, "batch 1"]]:
         """Forward pass.
 
         Returns:
@@ -438,8 +437,8 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
     Wraps Qwen3VLModel with a language model head for next-token prediction.
     """
     # Config
-    config: Qwen3VLConfigModel = field(metadata=dict(static=True))
-    vocab_size: int = field(metadata=dict(static=True))
+    config: Qwen3VLConfigModel = eqx.field(static=True)
+    vocab_size: int = eqx.field(static=True)
 
     # Models
     model: Qwen3VLModel
@@ -493,14 +492,14 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
     def __call__(
         self,
         input_ids: Int[Array, "batch seq"],
-        pixel_values: Optional[Float[Array, "total_patches C*T*H*W"]] = None,
-        image_grid_thw: Optional[Int[Array, "num_images 3"]] = None,
-        attention_mask: Optional[Float[Array, "batch seq"]] = None,
-        position_ids: Optional[Int[Array, "3 batch seq"]] = None,
-        cache: Optional[KVCache] = None,
-        rope_deltas: Optional[Int[Array, "batch 1"]] = None,
+        pixel_values: Float[Array, "total_patches C*T*H*W"] | None = None,
+        image_grid_thw: Int[Array, "num_images 3"] | None = None,
+        attention_mask: Float[Array, "batch seq"] | None = None,
+        position_ids: Int[Array, "3 batch seq"] | None = None,
+        cache: KVCache | None = None,
+        rope_deltas: Int[Array, "batch 1"] | None = None,
         use_cache: bool = False,
-        mm_token_type_ids: Optional[Int[Array, "batch seq"]] = None,
+        mm_token_type_ids: Int[Array, "batch seq"] | None = None,
         last_logit_only: bool = False,
     ) -> Qwen3VLOutput:
         """Forward pass.
@@ -576,12 +575,12 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
     def generate(
         self,
         input_ids: Int[Array, "batch seq"],
-        pixel_values: Optional[Float[Array, "total_patches C*T*H*W"]] = None,
-        image_grid_thw: Optional[Int[Array, "num_images 3"]] = None,
-        attention_mask: Optional[Float[Array, "batch seq"]] = None,
+        pixel_values: Float[Array, "total_patches C*T*H*W"] | None = None,
+        image_grid_thw: Int[Array, "num_images 3"] | None = None,
+        attention_mask: Float[Array, "batch seq"] | None = None,
         *,
-        cache: Optional[KVCache] = None,
-        rope_deltas: Optional[Int[Array, "batch 1"]] = None,
+        cache: KVCache | None = None,
+        rope_deltas: Int[Array, "batch 1"] | None = None,
         max_new_tokens: int,
         key: PRNGKeyArray,
         temperature: float = 1.0,
@@ -589,7 +588,7 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
         return_logits: bool = False,
         stop_token_id: int = -1,
         pad_token_id: int = 0,
-        mm_token_type_ids: Optional[Int[Array, "batch seq"]] = None,
+        mm_token_type_ids: Int[Array, "batch seq"] | None = None,
     ) -> Qwen3VLGenerateOutput:
         """Generate tokens using jax.lax.scan for efficiency.
 

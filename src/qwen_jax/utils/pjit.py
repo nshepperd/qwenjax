@@ -1,5 +1,9 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import ParamSpec, TypeVar, overload
+
 import jax
-from typing import ParamSpec, TypeVar, Callable, overload
 
 P = ParamSpec("P")
 R = TypeVar("R")

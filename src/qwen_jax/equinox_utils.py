@@ -1,12 +1,17 @@
+from __future__ import annotations
+
 import dataclasses
+from collections.abc import Callable
 from functools import partial
-from typing import Callable, TypeVar
+from typing import TypeVar
 
 import equinox as eqx
 import jax
 
 from .utils.collect import (
     collect as collect,
+)
+from .utils.collect import (
     label as label,
 )
 
@@ -21,7 +26,7 @@ def replace(module: T, **changes) -> T:
         else:
             object.__setattr__(ret, field.name, getattr(module, field.name))
     field_names = {field.name for field in dataclasses.fields(T)}
-    if any(k not in field_names for k in changes.keys()):
+    if any(k not in field_names for k in changes):
         raise ValueError(f"Invalid field names in changes: {set(changes.keys()) - field_names}")
     return ret
 

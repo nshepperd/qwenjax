@@ -1,13 +1,12 @@
-from dataclasses import field
+from __future__ import annotations
+
 import equinox as eqx
 import jax
-import jax.numpy as jnp
-from jaxtyping import Array, Float, PRNGKeyArray
-
-import numpy as np
-from .linear import Linear
-from . import equinox_utils as eu
 from bnb_jax.dequantize import QuantizedArray
+from jaxtyping import Array
+
+from . import equinox_utils as eu
+
 
 def _strip_prefix(s: str, state_dict: dict[str, jax.Array]) -> dict[str, jax.Array]:
     """Strip prefix s from all keys in state_dict that start with s."""
@@ -16,9 +15,9 @@ def _strip_prefix(s: str, state_dict: dict[str, jax.Array]) -> dict[str, jax.Arr
 class Linear4bit(eqx.Module):
     weight: QuantizedArray | None
     bias: jax.Array | None
-    in_features: int = field(metadata=dict(static=True))
-    out_features: int = field(metadata=dict(static=True))
-    use_bias: bool = field(metadata=dict(static=True))
+    in_features: int = eqx.field(static=True)
+    out_features: int = eqx.field(static=True)
+    use_bias: bool = eqx.field(static=True)
 
     def __init__(self, in_features: int, out_features: int, *, use_bias=True):
         self.in_features = in_features

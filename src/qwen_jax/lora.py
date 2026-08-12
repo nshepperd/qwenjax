@@ -1,20 +1,22 @@
-from .linear4bit import Linear4bit
-from pydantic.main import BaseModel
-from dataclasses import field
+from __future__ import annotations
+
 import json
+import re
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence, TypeVar
+from typing import TypeVar
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float, PRNGKeyArray
-from jax.tree_util import KeyPath
 import safetensors.flax as st
-import re
-
-from .linear import Linear
+from jax.tree_util import KeyPath
+from jaxtyping import Array, Float, PRNGKeyArray
+from pydantic.main import BaseModel
 
 from . import equinox_utils as eu
+from .linear import Linear
+from .linear4bit import Linear4bit
 
 
 class LoraConfig(BaseModel):
@@ -31,8 +33,8 @@ class LoraLinear(eqx.Module):
     lora_A: Linear
     lora_B: Linear
     alpha: Float[Array, ""] | Float[Array, "r"]
-    r: int = field(metadata=dict(static=True))
-    dtype: jnp.dtype = field(default=jnp.dtype('float32'), metadata=dict(static=True))
+    r: int = eqx.field(static=True)
+    dtype: jnp.dtype = eqx.field(default=jnp.dtype('float32'), static=True)
 
     @jax.remat
     def __call__(self, x: Array) -> Array:
@@ -50,7 +52,7 @@ class LoraAdapterItem(eqx.Module):
 class LoraAdapter(eqx.Module):
     weights: dict[str, LoraAdapterItem]
     alpha: Float[Array, ""]
-    r: int = field(metadata=dict(static=True))
+    r: int = eqx.field(static=True)
 
     def save_pretrained(self, path: Path | str):
         path = Path(path)

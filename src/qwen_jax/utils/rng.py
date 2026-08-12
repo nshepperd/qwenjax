@@ -1,6 +1,10 @@
+from __future__ import annotations
+
 from typing import overload
+
 import jax
 from jaxtyping import PRNGKeyArray
+
 
 @overload
 def split(key: PRNGKeyArray, num: int = 2) -> PRNGKeyArray: ...

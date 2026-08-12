@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 from collections import OrderedDict
+from collections.abc import Callable
 from functools import partial, wraps
-from typing import Callable, ParamSpec, TypeVar
+from typing import ParamSpec, TypeVar
 
 import jax
 import jax.extend.core

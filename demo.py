@@ -1,4 +1,5 @@
 """Simple demo: load a Qwen3-VL model and generate text."""
+from __future__ import annotations
 
 import argparse
 

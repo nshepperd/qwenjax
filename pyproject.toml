@@ -39,8 +39,16 @@ requires = ["hatchling"]
 [tool.hatch.build.targets.wheel]
 packages = ["src/qwen_jax"]
 
-[tool.ruff]
-ignore = ["F722", "F821"]
+[tool.ruff.lint]
+# jaxtyping shape strings (e.g. Float[Array, "batch seq"]) sit inside annotations,
+# so ruff reads them as forward references and misjudges them:
+#   F722/F821 - "batch seq" is not valid Python / `batch` is undefined.
+#   UP037     - under PEP 563 it thinks the quotes are redundant, but unquoting
+#               breaks typing.get_type_hints (see utils/buffer.resolved_fields).
+ignore = ["F722", "F821", "UP037"]
+
+[tool.ruff.lint.isort]
+required-imports = ["from __future__ import annotations"]
 
 [tool.hatch]
 metadata.allow-direct-references = true

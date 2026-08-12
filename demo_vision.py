@@ -1,4 +1,5 @@
 """Demo: vision understanding with Qwen3-VL in JAX."""
+from __future__ import annotations
 
 import os
 

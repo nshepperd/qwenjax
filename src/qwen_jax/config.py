@@ -1,8 +1,11 @@
 """Pydantic configuration models for Qwen3-VL."""
+from __future__ import annotations
 
 from pathlib import Path
+
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 from transformers import Qwen3VLConfig as HFQwen3VLConfig
+
 
 class Qwen3VLVisionConfig(BaseModel):
     """Configuration for the Qwen3-VL vision encoder."""
@@ -115,7 +118,7 @@ class Qwen3VLConfig(BaseModel):
     quantization_config: QuantizationConfig | None = None
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str | Path, **kwargs) -> "Qwen3VLConfig":
+    def from_pretrained(cls, pretrained_model_name_or_path: str | Path, **kwargs) -> Qwen3VLConfig:
         """Load the configuration from a pretrained model."""
         hf_config = HFQwen3VLConfig.from_pretrained(
             pretrained_model_name_or_path,

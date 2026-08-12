@@ -1,14 +1,15 @@
-from typing import TypeVar
-from typing import ParamSpec
-from typing import Any, Protocol, runtime_checkable
+from __future__ import annotations
+
+import sys
+from collections import OrderedDict
+from typing import Any, ParamSpec, Protocol, TypeVar, runtime_checkable
+
+import equinox as eqx
 import jax
 import torch
-import equinox as eqx
-from collections import OrderedDict
-import sys
-import jax.numpy as jnp
 
 import qwen_jax.equinox_utils as eu
+
 
 def to_jax(x, device=None):
     if isinstance(x, torch.Tensor):

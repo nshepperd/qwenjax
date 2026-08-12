@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import re
 
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array
+
 
 def gather(pattern: str, array: Array, indices: Array) -> Array:
     """Gather elements from array according to pattern and indices.

@@ -1,21 +1,17 @@
 """Attention layers for Qwen3-VL."""
-
-from einops import rearrange
-from dataclasses import field
-from typing import Optional
+from __future__ import annotations
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+from einops import rearrange
 from flash_attn_jax.varlen import flash_mha_varlen
-from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
+from jaxtyping import Array, Bool, Float, Int
+
+from qwen_jax.config import Qwen3VLTextConfig
 
 from . import equinox_utils as eu
 from .cache import KVCacheLayer
-from .utils.debug import debugpy_pm
-from .utils.rng import split
-from qwen_jax.config import Qwen3VLTextConfig
-
 from .linear import Linear, RMSNorm
 from .rope import apply_rotary_pos_emb, apply_rotary_pos_emb_vision
 
@@ -27,9 +23,9 @@ class Qwen3VLVisionAttention(eqx.Module):
     packed sequences (multiple images/videos of different sizes).
     """
 
-    dim: int = field(metadata=dict(static=True))
-    num_heads: int = field(metadata=dict(static=True))
-    head_dim: int = field(metadata=dict(static=True))
+    dim: int = eqx.field(static=True)
+    num_heads: int = eqx.field(static=True)
+    head_dim: int = eqx.field(static=True)
 
     qkv: Linear  # Fused QKV projection
     proj: Linear
@@ -132,11 +128,11 @@ class Qwen3VLTextAttention(eqx.Module):
     - Standard KV cache integration
     """
 
-    hidden_size: int = field(metadata=dict(static=True))
-    num_heads: int = field(metadata=dict(static=True))
-    num_kv_heads: int = field(metadata=dict(static=True))
-    head_dim: int = field(metadata=dict(static=True))
-    num_kv_groups: int = field(metadata=dict(static=True))
+    hidden_size: int = eqx.field(static=True)
+    num_heads: int = eqx.field(static=True)
+    num_kv_heads: int = eqx.field(static=True)
+    head_dim: int = eqx.field(static=True)
+    num_kv_groups: int = eqx.field(static=True)
 
     q_proj: Linear
     k_proj: Linear
@@ -199,11 +195,11 @@ class Qwen3VLTextAttention(eqx.Module):
         position_embeddings: tuple[
             Float[Array, "batch seq head_dim"], Float[Array, "batch seq head_dim"]
         ],
-        attention_mask: Optional[Float[Array, "batch 1 seq kv_seq"]] = None,
-        cache: Optional[KVCacheLayer] = None,
-        cache_position: Optional[Int[Array, ""]] = None,
-        kv_mask: Optional[Bool[Array, "batch kv_seq"]] = None,
-    ) -> tuple[Float[Array, "batch seq hidden"], Optional[KVCacheLayer]]:
+        attention_mask: Float[Array, "batch 1 seq kv_seq"] | None = None,
+        cache: KVCacheLayer | None = None,
+        cache_position: Int[Array, ""] | None = None,
+        kv_mask: Bool[Array, "batch kv_seq"] | None = None,
+    ) -> tuple[Float[Array, "batch seq hidden"], KVCacheLayer | None]:
         """Forward pass with optional KV cache.
 
         Args:
@@ -246,8 +242,6 @@ class Qwen3VLTextAttention(eqx.Module):
 
         # Compute attention
         # jax.nn.dot_product_attention expects (batch, seq, heads, head_dim) - NTHD order
-        scale = self.head_dim**-0.5
-
         dtype = q.dtype
         if dtype == jnp.float32:
             q = q.astype(jnp.float16)

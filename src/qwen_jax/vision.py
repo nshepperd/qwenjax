@@ -1,22 +1,21 @@
 """Vision model components for Qwen3-VL."""
-from qwen_jax.config import Qwen3VLVisionConfig
-from dataclasses import field
-from typing import Optional
-import numpy as np
+from __future__ import annotations
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float, Int, PRNGKeyArray
+import numpy as np
 from einops import rearrange
-
-from .linear import Linear, LayerNorm, Embedding
-from .mlp import Qwen3VLVisionMLP
-from .attention import Qwen3VLVisionAttention
-from .rope import Qwen3VLVisionRotaryEmbedding
-from . import equinox_utils as eu
-from .utils.rng import split
 from jax.scipy.interpolate import RegularGridInterpolator
+from jaxtyping import Array, Float, Int, PRNGKeyArray
 
+from qwen_jax.config import Qwen3VLVisionConfig
+
+from . import equinox_utils as eu
+from .attention import Qwen3VLVisionAttention
+from .linear import Embedding, LayerNorm, Linear
+from .mlp import Qwen3VLVisionMLP
+from .rope import Qwen3VLVisionRotaryEmbedding
 
 
 class PatchEmbedProj(eqx.Module):
@@ -25,9 +24,9 @@ class PatchEmbedProj(eqx.Module):
     reshaped to separate patches."""
     weight: Float[Array, "out_channels in_channels kernel_t kernel_h kernel_w"] | None
     bias: Float[Array, "out_channels"] | None
-    in_channels: int = field(metadata=dict(static=True))
-    out_channels: int = field(metadata=dict(static=True))
-    kernel_size: tuple[int, int, int] = field(metadata=dict(static=True))
+    in_channels: int = eqx.field(static=True)
+    out_channels: int = eqx.field(static=True)
+    kernel_size: tuple[int, int, int] = eqx.field(static=True)
     def __init__(self,
         in_channels: int,
         out_channels: int,
@@ -36,7 +35,6 @@ class PatchEmbedProj(eqx.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.kernel_size = kernel_size
-        kt, kh, kw = kernel_size
         self.weight = None
         self.bias = None
 
@@ -84,10 +82,10 @@ class Qwen3VLVisionPatchEmbed(eqx.Module):
     The input is in the format [num_patches x patch_rgb].
     Where patch_rgb = (in_channels=3 patch_t=2 patch_h=16 patch_w=16)
     """
-    patch_size: int = field(metadata=dict(static=True))
-    temporal_patch_size: int = field(metadata=dict(static=True))
-    in_channels: int = field(metadata=dict(static=True))
-    embed_dim: int = field(metadata=dict(static=True))
+    patch_size: int = eqx.field(static=True)
+    temporal_patch_size: int = eqx.field(static=True)
+    in_channels: int = eqx.field(static=True)
+    embed_dim: int = eqx.field(static=True)
 
     proj: PatchEmbedProj
 
@@ -131,10 +129,10 @@ class Qwen3VLVisionPatchMerger(eqx.Module):
 
     Merges 2x2 spatial patches and projects to output dimension.
     """
-    hidden_size: int = field(metadata=dict(static=True))
-    spatial_merge_size: int = field(metadata=dict(static=True))
-    out_hidden_size: int = field(metadata=dict(static=True))
-    use_postshuffle_norm: bool = field(metadata=dict(static=True))
+    hidden_size: int = eqx.field(static=True)
+    spatial_merge_size: int = eqx.field(static=True)
+    out_hidden_size: int = eqx.field(static=True)
+    use_postshuffle_norm: bool = eqx.field(static=True)
 
     norm: LayerNorm
     linear_fc1: Linear
@@ -204,7 +202,7 @@ class Qwen3VLVisionPatchMerger(eqx.Module):
 
 class Qwen3VLVisionBlock(eqx.Module):
     """Vision transformer block with pre-norm."""
-    hidden_size: int = field(metadata=dict(static=True))
+    hidden_size: int = eqx.field(static=True)
 
     norm1: LayerNorm
     norm2: LayerNorm
@@ -272,7 +270,7 @@ class Qwen3VLVisionModel(eqx.Module):
     at specified layers for DeepStack fusion in the text model.
     """
     # Config values
-    config: Qwen3VLVisionConfig = field(metadata=dict(static=True))
+    config: Qwen3VLVisionConfig = eqx.field(static=True)
 
     # Layers
     patch_embed: Qwen3VLVisionPatchEmbed

@@ -1,9 +1,11 @@
 """Generally useful debugging utilities."""
+from __future__ import annotations
 
-from functools import wraps
 import sys
-from typing import Callable, TypeVar
 import threading
+from collections.abc import Callable
+from functools import wraps
+from typing import TypeVar
 
 
 def maybe_debugpy_postmortem(excinfo):

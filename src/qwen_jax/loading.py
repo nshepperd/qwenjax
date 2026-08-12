@@ -1,21 +1,19 @@
-from .linear4bit import Linear4bit
-from .linear import Linear
-import dataclasses
-import warnings
+from __future__ import annotations
+
+import re
 from pathlib import Path
-from typing import Protocol, TypeVar, runtime_checkable
 
 import equinox as eqx
 import jax
 import safetensors.flax as st
-from jax import Array
 from tqdm import tqdm
-import re
+
+from qwen_jax.config import Qwen3VLConfig
+from qwen_jax.model import Qwen3VLForConditionalGeneration
 
 from . import equinox_utils as eu
-from .utils.buffer import is_param_or_persistent_buffer
-from qwen_jax.model import Qwen3VLForConditionalGeneration
-from qwen_jax.config import Qwen3VLConfig
+from .linear import Linear
+from .linear4bit import Linear4bit
 
 
 def path_to_str(path: jax.tree_util.KeyPath) -> str:
@@ -32,7 +30,7 @@ def load_qwen3_jax(model_path: str | Path, error_on_unused: bool = True) -> Qwen
 
     quantized_layers = set()
     RE_QUANT = re.compile(r"(.*)\.weight.quant_state.bitsandbytes__.*")
-    for key in state_dict.keys():
+    for key in state_dict:
         m = RE_QUANT.match(key)
         if m:
             quantized_layers.add(m.group(1))

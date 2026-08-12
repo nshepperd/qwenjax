@@ -1,14 +1,11 @@
 """MLP layers for Qwen3-VL."""
 from __future__ import annotations
-from dataclasses import field
 
 import equinox as eqx
 import jax
-import jax.numpy as jnp
 from jaxtyping import Array, Float, PRNGKeyArray
 
 from . import equinox_utils as eu
-
 from .linear import Linear
 
 
@@ -51,8 +48,8 @@ class Qwen3VLTextMLP(eqx.Module):
 
     SwiGLU: output = down_proj(silu(gate_proj(x)) * up_proj(x))
     """
-    hidden_size: int = field(metadata=dict(static=True))
-    intermediate_size: int = field(metadata=dict(static=True))
+    hidden_size: int = eqx.field(static=True)
+    intermediate_size: int = eqx.field(static=True)
 
     gate_proj: Linear
     up_proj: Linear

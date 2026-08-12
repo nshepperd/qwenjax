@@ -1,11 +1,12 @@
-import pytest
+from __future__ import annotations
+
 import jax.numpy as jnp
 import numpy as np
-from hypothesis import given, settings, assume
+import pytest
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from qwen_jax.utils.indexing import gather
-
 
 # ---------------------------------------------------------------------------
 # Validation error tests

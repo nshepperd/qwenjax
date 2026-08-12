@@ -51,7 +51,6 @@ class KVCacheLayer(NamedTuple):
         Returns:
             New KVCacheLayer with updated keys and values.
         """
-        seq_len = new_keys.shape[1]
         # Use dynamic_update_slice for writing multiple positions
         keys = jax.lax.dynamic_update_slice(
             self.keys, new_keys.astype(self.keys.dtype), (0, position, 0, 0)
@@ -127,7 +126,7 @@ class KVCache:
         num_kv_heads: int,
         head_dim: int,
         dtype=jnp.bfloat16,
-    ) -> "KVCache":
+    ) -> KVCache:
         """Create a new cache with pre-allocated arrays for all layers.
 
         Args:

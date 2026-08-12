@@ -1,9 +1,12 @@
-from typing import Sequence
+from __future__ import annotations
+
+from collections.abc import Sequence
+
 
 class ModulePath:
     components: tuple[str, ...]
 
-    def __init__(self, components: Sequence[str] | str | 'ModulePath'):
+    def __init__(self, components: Sequence[str] | str | ModulePath):
         if isinstance(components, str):
             components = components.strip('.').split('.')
         elif isinstance(components, ModulePath):
@@ -22,7 +25,7 @@ class ModulePath:
     def __str__(self) -> str:
         return '.'.join(self.components)
 
-    def __truediv__(self, other: 'str | ModulePath') -> 'ModulePath':
+    def __truediv__(self, other: str | ModulePath) -> ModulePath:
         if isinstance(other, ModulePath):
             return ModulePath(self.components + other.components)
         elif isinstance(other, str):
