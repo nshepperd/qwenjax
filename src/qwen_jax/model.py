@@ -26,11 +26,19 @@ from .vision import Qwen3VLVisionModel
 @jax.tree_util.register_dataclass
 @dataclass
 class Qwen3VLOutput:
-    """Output from Qwen3VL model."""
-    logits: Float[Array, "batch seq vocab"]
+    """Output from Qwen3VL model.
+
+    When ``last_logit_only=True`` was passed to the forward call, only
+    ``last_logits`` is populated — logits gathered at the last non-padded
+    position per batch item, which avoids the lm_head matmul over the whole
+    prompt. Otherwise ``logits`` holds the full ``(batch, seq, vocab)`` tensor
+    and ``last_logits`` is None.
+    """
+    logits: Optional[Float[Array, "batch seq vocab"]]
     hidden_states: Float[Array, "batch seq hidden"]
     rope_deltas: Int[Array, "batch 1"]
     cache: Optional[KVCache] = None
+    last_logits: Optional[Float[Array, "batch vocab"]] = None
 
 
 @jax.tree_util.register_dataclass
@@ -481,7 +489,7 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
             assert self._lm_head is not None
             return self._lm_head
 
-    @pjit(static_argnames=("use_cache",))
+    @pjit(static_argnames=("use_cache", "last_logit_only"))
     def __call__(
         self,
         input_ids: Int[Array, "batch seq"],
@@ -493,20 +501,19 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
         rope_deltas: Optional[Int[Array, "batch 1"]] = None,
         use_cache: bool = False,
         mm_token_type_ids: Optional[Int[Array, "batch seq"]] = None,
+        last_logit_only: bool = False,
     ) -> Qwen3VLOutput:
         """Forward pass.
 
         Args:
-            input_ids: Token IDs (batch, seq)
-            pixel_values: Image patches
-            image_grid_thw: Grid dimensions for each image
-            attention_mask: Attention mask
-            position_ids: Pre-computed position IDs
-            cache: KV cache
-            cache_position: Position in cache
+            last_logit_only: If True, skip the full lm_head projection over the
+                prompt and only compute logits at the last non-padded position
+                per batch item — populates ``Qwen3VLOutput.last_logits`` and
+                leaves ``Qwen3VLOutput.logits`` as None.
 
         Returns:
-            Qwen3VLOutput with logits, hidden_states, cache, rope_deltas
+            Qwen3VLOutput with hidden_states, cache, rope_deltas, plus either
+            logits (full) or last_logits ((batch, vocab)) depending on the flag.
         """
         if use_cache and cache is None:
             batch_size = input_ids.shape[0]
@@ -536,8 +543,28 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
             mm_token_type_ids=mm_token_type_ids,
         )
 
-        logits = self.lm_head(hidden_states)
+        if last_logit_only:
+            batch_size, seq_len = input_ids.shape
+            if attention_mask is not None:
+                mask_slice = attention_mask[:, :seq_len]
+                positions = jnp.arange(seq_len)
+                last_idx = jnp.max(
+                    positions[None, :] * (mask_slice == 1).astype(jnp.int32),
+                    axis=-1,
+                )
+            else:
+                last_idx = jnp.full((batch_size,), seq_len - 1, dtype=jnp.int32)
+            last_hidden = gather('b s h, b [s] -> b h', hidden_states, last_idx)
+            last_logits = self.lm_head(last_hidden)
+            return Qwen3VLOutput(
+                logits=None,
+                hidden_states=hidden_states,
+                cache=new_cache,
+                rope_deltas=new_rope_deltas,
+                last_logits=last_logits,
+            )
 
+        logits = self.lm_head(hidden_states)
         return Qwen3VLOutput(
             logits=logits,
             hidden_states=hidden_states,
@@ -607,6 +634,8 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
             )
 
         # === Step 3: Prefill - process entire prompt with images ===
+        # last_logit_only skips the lm_head matmul over the full prompt and only
+        # projects the last non-padded position — what we need to sample from.
         output = self(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -615,6 +644,7 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
             cache=cache,
             rope_deltas=rope_deltas,
             mm_token_type_ids=mm_token_type_ids,
+            last_logit_only=True,
         )
 
         def sample(logits, key):
@@ -624,9 +654,9 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
                 jnp.argmax(logits, axis=-1),
             )
 
-        # Sample first token
-        last_input_idx = jnp.max(jnp.arange(prompt_len)[None, :] * (attention_mask[:, :prompt_len] == 1), axis=-1)  # (batch,)
-        first_token_logits = gather('b s v, b [s] -> b v', output.logits, last_input_idx)
+        # Sample first token from the gathered last-position logits.
+        assert output.last_logits is not None, "last_logit_only=True must populate last_logits"
+        first_token_logits = output.last_logits  # (batch, vocab)
         key, subkey = jax.random.split(key)
         first_token = sample(first_token_logits, subkey)
         assert output.cache is not None, "Cache should not be None after forward pass"
