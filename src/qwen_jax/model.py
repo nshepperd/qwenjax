@@ -15,7 +15,7 @@ from .cache import KVCache
 from .config import (
     Qwen3VLConfig as Qwen3VLConfigModel,
 )
-from .linear import Embedding, Linear
+from .linear import Linear
 from .text import Qwen3VLTextModel
 from .utils.indexing import gather
 from .utils.pjit import pjit
@@ -75,9 +75,6 @@ class Qwen3VLModel(eqx.Module):
         self.language_model = Qwen3VLTextModel(
             config.text_config,
         )
-
-    def get_input_embeddings(self) -> Embedding:
-        return self.language_model.embed_tokens
 
     def get_image_features(
         self,

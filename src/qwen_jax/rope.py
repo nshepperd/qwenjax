@@ -32,19 +32,6 @@ class Qwen3VLVisionRotaryEmbedding(eqx.Module):
     def table(self, seq: Array):
         return jnp.outer(seq, self.inv_freq)
 
-    def __call__(self, seqlen: int) -> Float[Array, "seqlen dim_half"]:
-        """Compute frequency table for given sequence length.
-
-        Args:
-            seqlen: Maximum sequence length
-
-        Returns:
-            Frequency table of shape (seqlen, dim // 2)
-        """
-        seq = jnp.arange(seqlen, dtype=jnp.float32)
-        freqs = jnp.outer(seq, self.inv_freq)
-        return freqs
-
 
 def rotate_half(x: Array) -> Array:
     """Rotates half the hidden dims of the input."""

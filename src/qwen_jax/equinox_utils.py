@@ -43,22 +43,6 @@ def new(cls: type[T], /, **kwargs) -> T:
             raise TypeError(f"Missing value for field {field.name}")
     return ret
 
-def mapmod(
-    fn: Callable[[eqx.Module], eqx.Module],
-    module: T
-) -> T:
-    """Applies `fn` to every submodule in `module` and then to `module` itself.
-
-    Bottom-up recursion, like a catamorphism.
-    """
-    def proc(module):
-        if not isinstance(module, eqx.Module):
-            return module
-        module = jax.tree_util.tree_map(proc, module, is_leaf=lambda m: isinstance(m, eqx.Module) and m is not module)
-        return fn(module)
-    return proc(module)
-
-
 def mapmod_with_path(
     fn: Callable[[jax.tree_util.KeyPath, eqx.Module], eqx.Module], module: T
 ) -> T:

@@ -88,21 +88,6 @@ class Qwen3VLTextConfig(BaseModel):
                 break
         return data
 
-class QuantizationConfig(BaseModel):
-    _load_in_4bit: bool
-    _load_in_8bit: bool
-    bnb_4bit_compute_dtype: str
-    bnb_4bit_quant_storage: str
-    bnb_4bit_quant_type: str
-    bnb_4bit_use_double_quant: bool
-    llm_int8_enable_fp32_cpu_offload: bool
-    llm_int8_has_fp16_weight: bool
-    llm_int8_skip_modules: list[str]
-    llm_int8_threshold: float
-    load_in_4bit: bool
-    load_in_8bit: bool
-    quant_method: str
-
 class Qwen3VLConfig(BaseModel):
     """Configuration for the Qwen3-VL multimodal model."""
 
@@ -115,7 +100,6 @@ class Qwen3VLConfig(BaseModel):
     vision_start_token_id: int = 151652
     vision_end_token_id: int = 151653
     tie_word_embeddings: bool = False
-    quantization_config: QuantizationConfig | None = None
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str | Path, **kwargs) -> Qwen3VLConfig:

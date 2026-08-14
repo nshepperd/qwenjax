@@ -156,8 +156,3 @@ class KVCache:
             layers=tuple(layer.resize(new_max_seq_len) for layer in self.layers),
             position=jnp.minimum(self.position, new_max_seq_len),
         )
-
-    def extend(self, extend_by: int) -> KVCache:
-        """Extend the cache by a given number of positions."""
-        new_max_seq_len = self.max_seq_len + extend_by
-        return self.resize(new_max_seq_len)

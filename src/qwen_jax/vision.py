@@ -26,7 +26,6 @@ class PatchEmbedProj(eqx.Module):
     weight: Param
     bias: Param
     in_channels: int = eqx.field(static=True)
-    out_channels: int = eqx.field(static=True)
     kernel_size: tuple[int, int, int] = eqx.field(static=True)
     def __init__(self,
         in_channels: int,
@@ -34,7 +33,6 @@ class PatchEmbedProj(eqx.Module):
         kernel_size: tuple[int, int, int],
     ):
         self.in_channels = in_channels
-        self.out_channels = out_channels
         self.kernel_size = kernel_size
         self.weight = Param(out_channels, in_channels, *kernel_size)
         self.bias = Param(out_channels)
@@ -108,7 +106,6 @@ class Qwen3VLVisionPatchMerger(eqx.Module):
     """
     hidden_size: int = eqx.field(static=True)
     spatial_merge_size: int = eqx.field(static=True)
-    out_hidden_size: int = eqx.field(static=True)
     use_postshuffle_norm: bool = eqx.field(static=True)
 
     norm: LayerNorm
@@ -122,7 +119,6 @@ class Qwen3VLVisionPatchMerger(eqx.Module):
         use_postshuffle_norm: bool = False,
     ):
         self.spatial_merge_size = config.spatial_merge_size
-        self.out_hidden_size = config.out_hidden_size
         self.use_postshuffle_norm = use_postshuffle_norm
 
         # After merging 2x2 patches, hidden size multiplied by 4
@@ -171,8 +167,6 @@ class Qwen3VLVisionPatchMerger(eqx.Module):
 
 class Qwen3VLVisionBlock(eqx.Module):
     """Vision transformer block with pre-norm."""
-    hidden_size: int = eqx.field(static=True)
-
     norm1: LayerNorm
     norm2: LayerNorm
     attn: Qwen3VLVisionAttention
@@ -184,8 +178,6 @@ class Qwen3VLVisionBlock(eqx.Module):
         intermediate_size: int,
         num_heads: int,
     ):
-        self.hidden_size = hidden_size
-
         self.norm1 = LayerNorm(hidden_size, eps=1e-6)
         self.norm2 = LayerNorm(hidden_size, eps=1e-6)
         self.attn = Qwen3VLVisionAttention(hidden_size, num_heads)

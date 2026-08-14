@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from .attention import Qwen3VLTextAttention, Qwen3VLVisionAttention
 from .cache import KVCache, KVCacheLayer
-from .equinox_utils import mapmod, mapmod_with_path, replace
+from .equinox_utils import mapmod_with_path, replace
 
 # Linear layers
 from .linear import Embedding, LayerNorm, Linear, RMSNorm
@@ -42,7 +42,6 @@ __all__ = [
     "KVCacheLayer",
     # Utilities
     "replace",
-    "mapmod",
     "mapmod_with_path",
     # Linear layers
     "Linear",

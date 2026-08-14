@@ -46,7 +46,7 @@ packages = ["src/qwen_jax"]
 # so ruff reads them as forward references and misjudges them:
 #   F722/F821 - "batch seq" is not valid Python / `batch` is undefined.
 #   UP037     - under PEP 563 it thinks the quotes are redundant, but unquoting
-#               breaks typing.get_type_hints (see utils/buffer.resolved_fields).
+#               breaks typing.get_type_hints.
 ignore = ["F722", "F821", "UP037"]
 
 [tool.ruff.lint.isort]

@@ -18,9 +18,6 @@ from .rope import Qwen3VLTextRotaryEmbedding
 
 class Qwen3VLTextDecoderLayer(eqx.Module):
     """Qwen3-VL text decoder layer with pre-norm."""
-    hidden_size: int = eqx.field(static=True)
-    layer_idx: int = eqx.field(static=True)
-
     input_layernorm: RMSNorm
     self_attn: Qwen3VLTextAttention
     post_attention_layernorm: RMSNorm
@@ -29,11 +26,7 @@ class Qwen3VLTextDecoderLayer(eqx.Module):
     def __init__(
         self,
         config: Qwen3VLTextConfig,
-        layer_idx: int = 0,
     ):
-        self.hidden_size = config.hidden_size
-        self.layer_idx = layer_idx
-
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_attn = Qwen3VLTextAttention(
             config=config,
@@ -106,15 +99,10 @@ class Qwen3VLTextModel(eqx.Module):
     ):
         self.config = config
         self.embed_tokens = Embedding(self.config.vocab_size, self.config.hidden_size)
-        layers = []
-        for layer_idx in range(self.config.num_hidden_layers):
-            layers.append(
-                Qwen3VLTextDecoderLayer(
-                    config=self.config,
-                    layer_idx=layer_idx,
-                )
-            )
-        self.layers = tuple(layers)
+        self.layers = tuple(
+            Qwen3VLTextDecoderLayer(config=self.config)
+            for _ in range(self.config.num_hidden_layers)
+        )
         self.norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(
             config=self.config,

@@ -22,7 +22,6 @@ class Qwen3VLVisionAttention(eqx.Module):
     packed sequences (multiple images/videos of different sizes).
     """
 
-    dim: int = eqx.field(static=True)
     num_heads: int = eqx.field(static=True)
     head_dim: int = eqx.field(static=True)
 
@@ -34,7 +33,6 @@ class Qwen3VLVisionAttention(eqx.Module):
         hidden_size: int,
         num_heads: int,
     ):
-        self.dim = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
 
@@ -121,11 +119,9 @@ class Qwen3VLTextAttention(eqx.Module):
     - Standard KV cache integration
     """
 
-    hidden_size: int = eqx.field(static=True)
     num_heads: int = eqx.field(static=True)
     num_kv_heads: int = eqx.field(static=True)
     head_dim: int = eqx.field(static=True)
-    num_kv_groups: int = eqx.field(static=True)
 
     q_proj: Linear
     k_proj: Linear
@@ -138,11 +134,9 @@ class Qwen3VLTextAttention(eqx.Module):
         self,
         config: Qwen3VLTextConfig,
     ):
-        self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
-        self.num_kv_groups = config.num_attention_heads // config.num_key_value_heads
 
         self.q_proj = Linear(
             config.hidden_size,
