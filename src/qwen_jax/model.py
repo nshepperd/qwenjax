@@ -16,6 +16,7 @@ from .config import (
     Qwen3VLConfig as Qwen3VLConfigModel,
 )
 from .linear import Linear
+from .mrope import get_rope_index
 from .text import Qwen3VLTextModel
 from .utils.indexing import gather
 from .utils.pjit import pjit
@@ -100,180 +101,15 @@ class Qwen3VLModel(eqx.Module):
         attention_mask: Float[Array, "batch seq"] | None = None,
         mm_token_type_ids: Int[Array, "batch seq"] | None = None,
     ) -> tuple[Int[Array, "3 batch seq"], Int[Array, "batch 1"]]:
-        """Compute 3D position IDs for MRoPE (JIT-compatible).
-
-        For text tokens: all three dimensions have the same position
-        For image tokens: positions reflect (T, H, W) grid coordinates
-
-        Args:
-            input_ids: Token IDs (batch, seq)
-            image_grid_thw: Grid dimensions for each image
-            attention_mask: Attention mask
-            mm_token_type_ids: Per-token modality (0=text, 1=image, 2=video).
-                If None, derived from input_ids using image_token_id/video_token_id.
-
-        Returns:
-            (position_ids, rope_deltas) tuple
-        """
-        batch_size, seq_len = input_ids.shape
-        spatial_merge_size = self.config.vision_config.spatial_merge_size
-
-        attention_mask = attention_mask[:, -seq_len:] if attention_mask is not None else None
-
-        # Handle text-only case (already JIT-compatible)
-        if image_grid_thw is None:
-            if attention_mask is not None:
-                position_ids = jnp.cumsum(attention_mask, axis=-1) - 1
-                position_ids = jnp.where(attention_mask == 0, 1, position_ids)
-                position_ids = jnp.broadcast_to(position_ids[None, ...], (3, batch_size, seq_len))
-                max_position = position_ids.max(axis=(0, 2))  # (batch,)
-                rope_deltas = (max_position + 1 - seq_len)[:, None]
-            else:
-                position_ids = jnp.broadcast_to(
-                    jnp.arange(seq_len)[None, None, :],
-                    (3, batch_size, seq_len)
-                )
-                rope_deltas = jnp.zeros((batch_size, 1), dtype=jnp.int32)
-            return position_ids, rope_deltas
-
-        # With images: JIT-compatible vectorized implementation
-        if attention_mask is None:
-            attention_mask = jnp.ones_like(input_ids)
-
-        # Derive image_mask from mm_token_type_ids (preferred) or input_ids (fallback)
-        if mm_token_type_ids is not None:
-            image_mask = (mm_token_type_ids == 1) & (attention_mask == 1)
-        else:
-            image_token_id = self.config.image_token_id
-            valid_ids = jnp.where(attention_mask == 1, input_ids, -1)
-            image_mask = (valid_ids == image_token_id)
-
-        # Compute LLM grid dimensions for each image
-        llm_grid_t = image_grid_thw[:, 0]
-        llm_grid_h = image_grid_thw[:, 1] // spatial_merge_size
-        llm_grid_w = image_grid_thw[:, 2] // spatial_merge_size
-        tokens_per_image = llm_grid_t * llm_grid_h * llm_grid_w  # (num_images,)
-        num_images = image_grid_thw.shape[0]
-
-        # Count images per batch item by counting segment-starts of image_mask.
-        # A segment starts where image_mask is True and the previous position is not.
-        shifted_image_mask = jnp.pad(image_mask[:, :-1], ((0, 0), (1, 0)))
-        image_start_mask = image_mask & ~shifted_image_mask
-        images_per_batch = jnp.sum(image_start_mask, axis=-1)  # (batch,)
-
-        # Cumulative images before each batch item -> global image index offset
-        batch_image_offset = jnp.cumsum(jnp.pad(images_per_batch, (1, 0)))[:-1]  # (batch,)
-
-        # Create fenceposts for image tokens (global)
-        image_token_fenceposts = jnp.cumsum(jnp.pad(tokens_per_image, (1, 0)))  # (num_images + 1,)
-
-        # For each position, compute the cumulative image token count (within batch item)
-        cumsum_image_tokens = jnp.cumsum(image_mask.astype(jnp.int32), axis=-1)  # (batch, seq)
-
-        # For image tokens, determine which image they belong to (global index)
-        global_image_token_idx = (cumsum_image_tokens - 1) + batch_image_offset[:, None]  # (batch, seq)
-
-        # Use searchsorted to find which image each image token belongs to
-        flat_global_idx = global_image_token_idx.ravel()
-        image_idx = jnp.searchsorted(image_token_fenceposts, flat_global_idx, side='right') - 1
-        image_idx = image_idx.reshape(batch_size, seq_len)
-        image_idx = jnp.clip(image_idx, 0, num_images - 1)  # Safety clamp
-
-        # Local index within the image token block
-        local_idx = flat_global_idx - image_token_fenceposts[image_idx.ravel()]
-        local_idx = local_idx.reshape(batch_size, seq_len)
-
-        # Compute grid coordinates for image tokens
-        H = llm_grid_h[image_idx]  # (batch, seq)
-        W = llm_grid_w[image_idx]  # (batch, seq)
-
-        t_coord = local_idx // (H * W)
-        h_coord = (local_idx // W) % H
-        w_coord = local_idx % W
-
-        # Compute cumulative text count (ignoring images)
-        text_mask = ~image_mask & (attention_mask == 1)
-        text_cumsum = jnp.cumsum(text_mask.astype(jnp.int32), axis=-1)  # (batch, seq)
-
-        # Image position contribution: max(T, H, W) for each image
-        max_grid_dim = jnp.maximum(jnp.maximum(llm_grid_t, llm_grid_h), llm_grid_w)  # (num_images,)
-
-        def process_batch_item(b):
-            """Process a single batch item."""
-            mask = attention_mask[b]
-            img_mask_b = image_mask[b]
-            text_cumsum_b = text_cumsum[b]
-            img_cumsum_b = cumsum_image_tokens[b]
-
-            n_images_b = images_per_batch[b]
-            img_offset_b = batch_image_offset[b]
-
-            # Shifted cumsum for "before j"
-            img_cumsum_shifted = jnp.roll(img_cumsum_b, 1).at[0].set(0)
-
-            # For each position, find how many images are complete
-            # Use global fenceposts with adjustment
-            adjusted_img_cumsum = img_cumsum_shifted + image_token_fenceposts[img_offset_b]
-            num_complete_images = jnp.searchsorted(image_token_fenceposts, adjusted_img_cumsum, side='right') - 1 - img_offset_b
-            num_complete_images = jnp.clip(num_complete_images, 0, n_images_b)
-
-            # Sum of max_grid_dim contributions from complete images
-            max_grid_cumsum = jnp.cumsum(jnp.pad(max_grid_dim, (1, 0)))  # (num_images + 1,)
-            img_offset = max_grid_cumsum[img_offset_b + num_complete_images] - max_grid_cumsum[img_offset_b]
-
-            # For text tokens: position = text_cumsum - 1 + img_offset
-            text_pos = text_cumsum_b - 1 + img_offset
-
-            # For image tokens: base_offset + grid_coord
-            # Image segment starts where: img_mask_b is True and previous position is not image
-            img_seg_start = img_mask_b & ~jnp.roll(img_mask_b, 1).at[0].set(True)
-
-            # Base offset at image segment start positions
-            # = text count before this image + sum of max_grid_dim for images before this one
-            shifted_text_cumsum = jnp.roll(text_cumsum_b, 1).at[0].set(0)
-            shifted_img_offset = jnp.roll(img_offset, 1).at[0].set(0)
-            base_offset_at_img_start = shifted_text_cumsum + shifted_img_offset
-
-            # Propagate base_offset to all image tokens using cummax
-            base_offset_masked = jnp.where(img_seg_start, base_offset_at_img_start, -1)
-            base_offset_propagated = jnp.maximum.accumulate(base_offset_masked)
-            base_offset_propagated = jnp.where(img_mask_b, base_offset_propagated, 0)
-
-            # Compute image token positions with grid coordinates
-            t_c = t_coord[b]
-            h_c = h_coord[b]
-            w_c = w_coord[b]
-
-            img_pos_t = base_offset_propagated + t_c
-            img_pos_h = base_offset_propagated + h_c
-            img_pos_w = base_offset_propagated + w_c
-
-            # Combine text and image positions
-            pos_t = jnp.where(img_mask_b, img_pos_t, text_pos)
-            pos_h = jnp.where(img_mask_b, img_pos_h, text_pos)
-            pos_w = jnp.where(img_mask_b, img_pos_w, text_pos)
-
-            # Handle masked positions (attention_mask == 0)
-            pos_t = jnp.where(mask == 1, pos_t, 1)
-            pos_h = jnp.where(mask == 1, pos_h, 1)
-            pos_w = jnp.where(mask == 1, pos_w, 1)
-
-            pos_ids = jnp.stack([pos_t, pos_h, pos_w], axis=0)  # (3, seq)
-
-            # Rope delta = max_position + 1 - seq_len
-            max_pos = jnp.max(pos_ids)
-            rope_delta = max_pos + 1 - seq_len
-
-            return pos_ids, rope_delta
-
-        # vmap over batch dimension
-        position_ids, rope_deltas = jax.vmap(process_batch_item)(jnp.arange(batch_size))
-
-        # position_ids shape: (batch, 3, seq) -> need (3, batch, seq)
-        position_ids = jnp.transpose(position_ids, (1, 0, 2))
-        rope_deltas = rope_deltas[:, None]  # (batch, 1)
-
-        return position_ids, rope_deltas
+        """Compute 3D position IDs for MRoPE. See `qwen_jax.mrope`."""
+        return get_rope_index(
+            input_ids,
+            image_grid_thw,
+            attention_mask,
+            mm_token_type_ids,
+            spatial_merge_size=self.config.vision_config.spatial_merge_size,
+            image_token_id=self.config.image_token_id,
+        )
 
     def _splice_image_embeds(
         self,
