@@ -60,9 +60,7 @@ metadata.allow-direct-references = true
 [tool.ty.environment]
 root = ["./src/"]
 [tool.uv.sources]
-# Point at the working tree: the Q6_K kernel we need is not pushed to main yet.
-# Drop this table to build against the published git revision instead.
-gguf-jax = { path = "../gguf-jax", editable = true }
+# gguf-jax = { path = "../gguf-jax", editable = true }
 
 [tool.uv]
 # gguf-jax floors jax at >=0.11.0, but flash_attn_jax caps it at <0.9.0 and the
