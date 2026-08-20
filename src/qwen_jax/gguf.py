@@ -24,15 +24,14 @@ Two things about GGUF make it more than a rename of `linear4bit`:
 """
 from __future__ import annotations
 
-import os
 import re
 from pathlib import Path
 from typing import Self
 
 import equinox as eqx
+import gguf_jax
 import jax
 import jax.numpy as jnp
-import numpy as np
 from gguf.constants import GGMLQuantizationType as QT
 from gguf_jax import QuantizedArray, load_gguf
 from jaxtyping import Array
@@ -174,143 +173,6 @@ class GGUFParam(AbstractParam):
         return eu.replace(self, array=array)
 
 
-def _fused_matmul(x: Array, w: QuantizedArray) -> Array | None:
-    """`x @ w.T` via a fused dequant-matmul kernel, or None if there isn't one.
-
-    The kernels keep the weight quantized in HBM, which is the difference
-    between a 7 GB resident model and one that transiently materializes a
-    dense copy of whichever tensor it is multiplying by.
-
-    Each kernel only fuses up to some batch size and above it falls back to
-    dequantizing the whole weight -- exactly the allocation the fused path
-    exists to avoid, and enough to OOM a 16 GB card on the lm_head during
-    prefill. Past that point this returns None so the caller can dequantize in
-    bounded blocks instead.
-    """
-    if x.dtype != jnp.bfloat16:
-        return None
-    try:
-        from gguf_jax import cute
-        from gguf_jax.cute import iq4_xs as _iq4_xs
-        from gguf_jax.cute import q4_k as _q4_k
-        from gguf_jax.cute import q5_k as _q5_k
-        from gguf_jax.cute import q6_k as _q6_k
-    except ImportError:
-        return None
-    batch = int(np.prod(x.shape[:-1]))
-    if w.qtype == QT.Q4_K:
-        # The only type with a tensor-core GEMM as well, and it only applies
-        # when the output rows tile evenly.
-        fused_max = max(_q4_k._GEMV_MAX_M,
-                        _q4_k._GEMM_MAX_M if w.shape[0] % _q4_k_gemm_bn() == 0 else 0)
-        return cute.matmul_q4_k(x, w) if batch <= fused_max else None
-    # The warp-GEMV-only types. Missing one of these is expensive out of
-    # proportion to its share of the weights: an unfused tensor does not merely
-    # skip the fast path, it adds a dense round-trip that the fused ones never
-    # pay, which is what made UD-Q4_K_XL decode at 59 tok/s against Q4_K_M's 91
-    # on 18% unfused bytes.
-    for qtype, fn, mod in (
-        (QT.Q6_K, cute.matmul_q6_k, _q6_k),
-        (QT.Q5_K, cute.matmul_q5_k, _q5_k),
-        (QT.IQ4_XS, cute.matmul_iq4_xs, _iq4_xs),
-    ):
-        if w.qtype == qtype:
-            return fn(x, w) if batch <= mod._GEMV_MAX_M else None
-    return None
-
-
-def _q4_k_gemm_bn() -> int:
-    from gguf_jax.cute.q4_k_gemm import _BN
-
-    return _BN
-
-
-# Cap on the temporary a single dequantize may allocate, so that one weight too
-# large to sit in scratch is split across output rows -- they are independent,
-# so splitting them bounds the temporary without changing the result. The
-# 151936 x 4096 lm_head is the case that needs it: 1.24 GB dequantized.
-#
-# Sized as 4*N*K, i.e. as though the buffer were float32. It is not -- decoding
-# is fused into the convert, so what reaches memory is bf16 at 2*N*K, and this
-# budget is a 2x conservative one. Left as is deliberately; the headroom is
-# cheap and the number of buffers matters more than the size of any one of them
-# (see the optimization barrier in `_blocked_matmul`).
-DEQUANT_BLOCK_BYTES = int(os.environ.get("QWEN_JAX_DEQUANT_BLOCK_BYTES", 512 << 20))
-
-
-def _block_count(out_rows: int, in_features: int) -> int:
-    """How many row blocks keep one dequantize under `DEQUANT_BLOCK_BYTES`.
-
-    Constrained to divisors of `out_rows` so the blocks are uniform, which is
-    what lets the split be a `scan`.
-    """
-    needed = 4 * out_rows * in_features
-    if needed <= DEQUANT_BLOCK_BYTES:
-        return 1
-    target = -(-needed // DEQUANT_BLOCK_BYTES)
-    for n in range(target, out_rows + 1):
-        if out_rows % n == 0:
-            return n
-    return out_rows
-
-
-def _blocked_matmul(x: Array, w: QuantizedArray) -> Array:
-    """`x @ w.T`, dequantizing the weight in bounded blocks of output rows.
-
-    A loop rather than a Python loop over slices: unrolled blocks are
-    independent, so XLA schedules them concurrently and every block's temporary
-    is live at once -- which is the allocation this is trying to avoid. The
-    loop makes the sequencing explicit, so only one block is resident at a
-    time. The same hazard across *different* weights is what the optimization
-    barrier below handles; this loop only orders the blocks within one.
-
-    Each block writes its columns into the output in place. Stacking the blocks
-    and transposing instead would be shorter, but it materializes the whole
-    result twice and the transpose of that is large enough that XLA fails to
-    find a config for it.
-    """
-    out_rows, in_features = w.shape
-    blocks = _block_count(out_rows, in_features)
-
-    # Pin the dequantize to this layer's place in the network.
-    #
-    # A dequantize depends only on the weight, which is a parameter and so is
-    # available from the first instruction of the executable. XLA is therefore
-    # free to hoist every one of them arbitrarily early, and it does: profiling
-    # a Q6_K prefill (where M is above every fused cap, so all ~252 matmuls take
-    # this path) found 108 dequantized gate/up weights laid out at 68 distinct
-    # offsets in the temp arena -- 68 live at once, 3.66 GiB of scratch on top
-    # of 6.7 GB of weights, which does not fit on a 16 GB card.
-    #
-    # Routing the weight bytes through an optimization barrier together with x
-    # gives the dequantize an artificial dependency on the activation arriving
-    # at this layer, so it cannot be scheduled before the layers feeding it.
-    # That chains the dequantizes into the network's own sequential order and
-    # takes the arena to 193 MiB -- about two live, which is the real floor
-    # here: gate_proj and up_proj consume the same x, so those two legitimately
-    # overlap. Semantically a no-op; verified bitwise identical output.
-    data, x = jax.lax.optimization_barrier((w.data, x))
-    w = QuantizedArray(data=data, qtype=w.qtype, shape=w.shape, dtype=w.dtype)
-
-    if blocks == 1:
-        return x @ w.dequantize().T
-
-    rows = out_rows // blocks
-    flat = x.reshape(-1, in_features)
-    data = w.data.reshape(blocks, rows, -1)
-    out = jnp.zeros((flat.shape[0], out_rows), dtype=w.dtype)
-
-    def body(i, out):
-        sub = QuantizedArray(
-            data=jax.lax.dynamic_index_in_dim(data, i, keepdims=False),
-            qtype=w.qtype, shape=(rows, in_features), dtype=w.dtype,
-        )
-        return jax.lax.dynamic_update_slice(out, flat @ sub.dequantize().T, (0, i * rows))
-
-    out = jax.lax.fori_loop(0, blocks, body, out)
-    return out.reshape(*x.shape[:-1], out_rows)
-
-
 class LinearGGUF(eqx.Module):
     """`Linear` over a GGUF-quantized weight."""
 
@@ -334,9 +196,12 @@ class LinearGGUF(eqx.Module):
     @jax.remat  # type: ignore  # should be exported
     def __call__(self, x: Array):
         w = self.weight()
-        y = _fused_matmul(x, w) if self.fused else None
-        if y is None:
-            y = _blocked_matmul(x, w)
+        # gguf_jax picks the route: a fused kernel where one covers this qtype
+        # and batch size, otherwise dequantize-then-matmul, blocked if the
+        # weight is too large to materialize at once. `fused=False` forces the
+        # second, which is what makes the two comparable in a benchmark.
+        y = (gguf_jax.matmul(x, w) if self.fused
+             else gguf_jax.dequant_matmul(x, w))
         if self.bias is not None:
             y += self.bias()
         return y
