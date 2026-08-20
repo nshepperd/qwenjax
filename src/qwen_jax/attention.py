@@ -10,6 +10,7 @@ from jaxtyping import Array, Bool, Float, Int
 
 from qwen_jax.config import Qwen3VLTextConfig
 
+from . import attention_xla as axla
 from .cache import KVCacheLayer
 from .linear import Linear, RMSNorm
 from .rope import apply_rotary_pos_emb, apply_rotary_pos_emb_vision
@@ -78,7 +79,7 @@ class Qwen3VLVisionAttention(eqx.Module):
 
         # flash_mha_varlen requires float16 or bfloat16
         orig_dtype = q.dtype
-        if orig_dtype == jnp.float32:
+        if orig_dtype == jnp.float32 and axla.use_flash():
             q = q.astype(jnp.float16)
             k = k.astype(jnp.float16)
             v = v.astype(jnp.float16)
@@ -86,22 +87,28 @@ class Qwen3VLVisionAttention(eqx.Module):
         # Compute max sequence length for flash attention
         max_seqlen = hidden_states.shape[0]
 
-        # Variable-length flash attention
-        attn_output = flash_mha_varlen(
-            q,
-            k,
-            v,
-            seqlens_q=cu_seqlens,
-            seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            softmax_scale=self.head_dim**-0.5,
-            is_causal=False,
-        )
+        if axla.use_flash():
+            # Variable-length flash attention
+            attn_output = flash_mha_varlen(
+                q,
+                k,
+                v,
+                seqlens_q=cu_seqlens,
+                seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                softmax_scale=self.head_dim**-0.5,
+                is_causal=False,
+            )
+        else:
+            attn_output = axla.masked_attention(
+                q, k, v,
+                axla.segment_mask(cu_seqlens, seq_len),
+                scale=self.head_dim**-0.5,
+            )
 
         # Convert back to original dtype
-        if orig_dtype == jnp.float32:
-            attn_output = attn_output.astype(orig_dtype)
+        attn_output = attn_output.astype(orig_dtype)
 
         # Reshape back: (seq, heads, head_dim) -> (seq, hidden)
         attn_output = attn_output.reshape(seq_len, -1)
@@ -218,13 +225,28 @@ class Qwen3VLTextAttention(eqx.Module):
         # Compute attention
         # jax.nn.dot_product_attention expects (batch, seq, heads, head_dim) - NTHD order
         dtype = q.dtype
-        if dtype == jnp.float32:
+        if dtype == jnp.float32 and axla.use_flash():
+            # The flash kernel only takes 16-bit inputs; the XLA path does not
+            # need the downcast and a float32 reference should not pay it.
             q = q.astype(jnp.float16)
             k = k.astype(jnp.float16)
             v = v.astype(jnp.float16)
 
         # Use JAX's dot product attention
-        if kv_mask is not None and cache is None:
+        if not axla.use_flash():
+            if kv_mask is None:
+                raise NotImplementedError(
+                    "Causal attention without mask is not implemented."
+                )
+            if cache is None:
+                mask = jax.vmap(axla.causal_mask, in_axes=(0, None))(kv_mask, seq_len)
+            else:
+                assert cache_position is not None
+                mask = jax.vmap(axla.causal_mask, in_axes=(0, None, None))(
+                    kv_mask, seq_len, cache_position
+                )
+            attn_output = jax.vmap(axla.masked_attention)(q, k, v, mask)
+        elif kv_mask is not None and cache is None:
             # no cache and we have mask. use varlen attn
             assert kv_mask.shape == (batch_size, seq_len)
 
