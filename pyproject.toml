@@ -3,7 +3,7 @@ name = "qwen-jax"
 version = "0.1.0"
 description = "Qwen3-VL vision-language model in JAX/Equinox"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "jax[cuda12]>=0.8.2",
     # 0.13.8 added a typed Module.__new__, without which type checkers infer
@@ -11,6 +11,7 @@ dependencies = [
     "equinox>=0.13.8",
     "bitsandbytes-jax @ git+https://github.com/nshepperd/bitsandbytes-jax.git@main",
     "flash_attn_jax==0.6.2",
+    "gguf-jax @ git+https://github.com/nshepperd/gguf-jax.git@main",
     "transformers>=5.3.0",
     "einops",
     "jax-tqdm",
@@ -32,6 +33,7 @@ test = [
     "optax",
     "wandb",
     "hypothesis",
+    "pyarrow>=25.0.1",
 ]
 
 [build-system]
@@ -57,3 +59,22 @@ metadata.allow-direct-references = true
 
 [tool.ty.environment]
 root = ["./src/"]
+[tool.uv.sources]
+# Point at the working tree: the Q6_K kernel we need is not pushed to main yet.
+# Drop this table to build against the published git revision instead.
+gguf-jax = { path = "../gguf-jax", editable = true }
+
+[tool.uv]
+# gguf-jax floors jax at >=0.11.0, but flash_attn_jax caps it at <0.9.0 and the
+# wheels we have are 0.8.3, so pin the bound down rather than give up flash
+# attention.
+#
+# That floor is not incidental: jax's FFI registration API changed after 0.8, so
+# the CuTe kernels need a jax-tvm-ffi matched to jaxlib. On 0.8.x that is 0.1.2 --
+# with 0.1.3 every kernel registers into tvm-ffi's own table and none of them
+# reach jaxlib's, and each call dies with "No FFI handler registered for
+# cutejax.<kernel> on a platform CUDA". Silent until the first fused matmul runs.
+override-dependencies = [
+    "jax[cuda12]>=0.8.2,<0.9.0",
+    "jax-tvm-ffi==0.1.2",
+]
