@@ -22,6 +22,13 @@ sampling, so nothing depends on a seed.
 Perplexity alone can look fine while a model has quietly become a different
 model; agreement and KL are what catch that.
 
+One batched pass scores every position at once, which is fast but runs at
+M = seq_len -- above every fused batch cap, so it takes dequantize-then-matmul
+and never calls a fused kernel. It would therefore score a broken warp-GEMV as
+perfect. `--decode` teacher-forces one token at a time through the KV cache
+instead: far slower, but it is the only mode that measures the kernels decode
+actually uses.
+
 Speed is measured on whatever device JAX defaults to, separately for prefill
 (one pass over a long prompt) and decode (cached, one token at a time), since
 quantized matmuls behave very differently in the two regimes.
@@ -36,6 +43,9 @@ Usage:
         python bench/quantization.py accuracy --variants $v --json out-$v.json
     done
     python bench/quantization.py report out-*.json
+
+    # accuracy of the fused kernels themselves, through the decode path
+    python bench/quantization.py accuracy --variants q4km --chunks 2 --decode
 
     # just the bf16 reference, cached for later runs (slow, host-only)
     python bench/quantization.py reference
@@ -259,6 +269,46 @@ def chunk_logprobs(model, chunk: np.ndarray) -> np.ndarray:
     return np.asarray(jax.nn.log_softmax(out.logits[0].astype(jnp.float32), axis=-1))
 
 
+def chunk_logprobs_decode(model, chunk: np.ndarray) -> np.ndarray:
+    """Same thing, but teacher-forced one token at a time through the KV cache.
+
+    This exists because the batched path above is blind to the fused kernels: at
+    M = seq_len it is above every fused batch cap, so it takes
+    dequantize-then-matmul and would score a broken warp-GEMV as perfect. Decode
+    is also the regime the fused kernels were written for, so it is the one whose
+    accuracy anybody actually relies on. Much slower -- one launch per position.
+    """
+    from qwen_jax.cache import KVCache
+
+    cfg = model.model.config.text_config
+    seq = len(chunk)
+    input_ids = jnp.asarray(chunk)[None, :]
+    mask = jnp.ones((1, seq + 1), jnp.int32)
+    cache = KVCache.create(
+        num_layers=cfg.num_hidden_layers, batch_size=1, max_seq_len=seq + 1,
+        num_kv_heads=cfg.num_key_value_heads, head_dim=cfg.head_dim,
+        dtype=jnp.bfloat16)
+
+    @jax.jit
+    def step(model, cache, token, rope_deltas):
+        out = model(input_ids=token, attention_mask=mask, cache=cache,
+                    rope_deltas=rope_deltas)
+        lg = out.logits[:, -1, :].astype(jnp.float32)
+        return out.cache, jax.nn.log_softmax(lg, axis=-1)
+
+    # Position 0's prediction comes from the one-token prefill; nll() scores it
+    # like any other, so it has to be the real thing and not a placeholder.
+    out = model(input_ids=input_ids[:, :1], attention_mask=mask, cache=cache,
+                last_logit_only=True)
+    cache, rope_deltas = out.cache, out.rope_deltas
+    first = jax.nn.log_softmax(out.last_logits.astype(jnp.float32), axis=-1)
+    rows = [np.asarray(first[0], np.float32)]
+    for t in range(1, seq):
+        cache, lp = step(model, cache, input_ids[:, t:t + 1], rope_deltas)
+        rows.append(np.asarray(lp[0], np.float32))
+    return np.stack(rows)
+
+
 def nll(logprobs: np.ndarray, chunk: np.ndarray) -> np.ndarray:
     """Per-position negative log likelihood of the realised next token."""
     return -logprobs[:-1][np.arange(len(chunk) - 1), chunk[1:]]
@@ -278,6 +328,8 @@ def run_accuracy(args) -> None:
     tokenizer = AutoTokenizer.from_pretrained(HF_BF16)
     chunks = make_chunks(tokenizer, args.chunks, args.seq_len)
     print(f"corpus: {args.chunks} x {args.seq_len} = {chunks.size} tokens of wikitext-2")
+    if args.decode:
+        print("scoring through the cached decode path (M=1), not one batched pass")
 
     ref = load_reference(chunks, args)
     rows = []
@@ -301,10 +353,11 @@ def run_accuracy(args) -> None:
             print(f"loaded in {time.time() - t:.0f}s, "
                   f"{weight_bytes(model) / 1e9:.2f} GB of weights", flush=True)
 
+            scorer = chunk_logprobs_decode if args.decode else chunk_logprobs
             per_chunk = []
             for i, chunk in enumerate(chunks):
                 t = time.time()
-                lp = chunk_logprobs(model, chunk)
+                lp = scorer(model, chunk)
                 stats = {"nll": float(nll(lp, chunk).mean())}
                 if ref is not None:
                     r = np.asarray(ref[i], dtype=np.float32)
@@ -545,6 +598,11 @@ def main() -> None:
                            help="build the reference now if it is not cached")
             s.add_argument("--reference-row", action="store_true",
                            help="also report the unquantized reference's own perplexity")
+            s.add_argument("--decode", action="store_true",
+                           help="score through the cached decode path (M=1) instead "
+                                "of one batched pass. Slower, but it is the only "
+                                "mode that exercises the fused kernels at all -- "
+                                "a batched pass is above every fused batch cap")
         if name == "speed":
             s.add_argument("--variants", type=parse_variants, default="all")
             s.add_argument("--prompt-len", type=int, default=1024)
