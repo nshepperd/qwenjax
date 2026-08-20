@@ -225,16 +225,16 @@ def _q4_k_gemm_bn() -> int:
     return _BN
 
 
-# Cap on the float32 temporary a single dequantize may allocate. Decoding
-# happens in float32 before the cast, so a whole weight costs 4*N*K bytes:
-# 2.5 GB for a 151936 x 4096 lm_head, which OOMs a 16 GB card already holding
-# the model. Output rows are independent, so splitting them bounds the
-# temporary without changing the result.
+# Cap on the temporary a single dequantize may allocate, so that one weight too
+# large to sit in scratch is split across output rows -- they are independent,
+# so splitting them bounds the temporary without changing the result. The
+# 151936 x 4096 lm_head is the case that needs it: 1.24 GB dequantized.
 #
-# Lower it on a tight card, or for a mixed-qtype file where more weights than
-# usual miss the fused kernels and take this path: XLA sizes one scratch buffer
-# for the whole forward pass, so the peak is what has to fit, not any single
-# tensor.
+# Sized as 4*N*K, i.e. as though the buffer were float32. It is not -- decoding
+# is fused into the convert, so what reaches memory is bf16 at 2*N*K, and this
+# budget is a 2x conservative one. Left as is deliberately; the headroom is
+# cheap and the number of buffers matters more than the size of any one of them
+# (see the optimization barrier in `_blocked_matmul`).
 DEQUANT_BLOCK_BYTES = int(os.environ.get("QWEN_JAX_DEQUANT_BLOCK_BYTES", 512 << 20))
 
 
@@ -258,10 +258,11 @@ def _blocked_matmul(x: Array, w: QuantizedArray) -> Array:
     """`x @ w.T`, dequantizing the weight in bounded blocks of output rows.
 
     A loop rather than a Python loop over slices: unrolled blocks are
-    independent, so XLA schedules them concurrently and every block's float32
-    temporary is live at once -- which is the allocation this is trying to
-    avoid. The loop makes the sequencing explicit, so only one block is
-    resident at a time.
+    independent, so XLA schedules them concurrently and every block's temporary
+    is live at once -- which is the allocation this is trying to avoid. The
+    loop makes the sequencing explicit, so only one block is resident at a
+    time. The same hazard across *different* weights is what the optimization
+    barrier below handles; this loop only orders the blocks within one.
 
     Each block writes its columns into the output in place. Stacking the blocks
     and transposing instead would be shorter, but it materializes the whole
@@ -270,6 +271,27 @@ def _blocked_matmul(x: Array, w: QuantizedArray) -> Array:
     """
     out_rows, in_features = w.shape
     blocks = _block_count(out_rows, in_features)
+
+    # Pin the dequantize to this layer's place in the network.
+    #
+    # A dequantize depends only on the weight, which is a parameter and so is
+    # available from the first instruction of the executable. XLA is therefore
+    # free to hoist every one of them arbitrarily early, and it does: profiling
+    # a Q6_K prefill (where M is above every fused cap, so all ~252 matmuls take
+    # this path) found 108 dequantized gate/up weights laid out at 68 distinct
+    # offsets in the temp arena -- 68 live at once, 3.66 GiB of scratch on top
+    # of 6.7 GB of weights, which does not fit on a 16 GB card.
+    #
+    # Routing the weight bytes through an optimization barrier together with x
+    # gives the dequantize an artificial dependency on the activation arriving
+    # at this layer, so it cannot be scheduled before the layers feeding it.
+    # That chains the dequantizes into the network's own sequential order and
+    # takes the arena to 193 MiB -- about two live, which is the real floor
+    # here: gate_proj and up_proj consume the same x, so those two legitimately
+    # overlap. Semantically a no-op; verified bitwise identical output.
+    data, x = jax.lax.optimization_barrier((w.data, x))
+    w = QuantizedArray(data=data, qtype=w.qtype, shape=w.shape, dtype=w.dtype)
+
     if blocks == 1:
         return x @ w.dequantize().T
 
