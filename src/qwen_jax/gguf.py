@@ -191,17 +191,31 @@ def _fused_matmul(x: Array, w: QuantizedArray) -> Array | None:
         return None
     try:
         from gguf_jax import cute
+        from gguf_jax.cute import iq4_xs as _iq4_xs
         from gguf_jax.cute import q4_k as _q4_k
+        from gguf_jax.cute import q5_k as _q5_k
         from gguf_jax.cute import q6_k as _q6_k
     except ImportError:
         return None
     batch = int(np.prod(x.shape[:-1]))
     if w.qtype == QT.Q4_K:
+        # The only type with a tensor-core GEMM as well, and it only applies
+        # when the output rows tile evenly.
         fused_max = max(_q4_k._GEMV_MAX_M,
                         _q4_k._GEMM_MAX_M if w.shape[0] % _q4_k_gemm_bn() == 0 else 0)
         return cute.matmul_q4_k(x, w) if batch <= fused_max else None
-    if w.qtype == QT.Q6_K:
-        return cute.matmul_q6_k(x, w) if batch <= _q6_k._GEMV_MAX_M else None
+    # The warp-GEMV-only types. Missing one of these is expensive out of
+    # proportion to its share of the weights: an unfused tensor does not merely
+    # skip the fast path, it adds a dense round-trip that the fused ones never
+    # pay, which is what made UD-Q4_K_XL decode at 59 tok/s against Q4_K_M's 91
+    # on 18% unfused bytes.
+    for qtype, fn, mod in (
+        (QT.Q6_K, cute.matmul_q6_k, _q6_k),
+        (QT.Q5_K, cute.matmul_q5_k, _q5_k),
+        (QT.IQ4_XS, cute.matmul_iq4_xs, _iq4_xs),
+    ):
+        if w.qtype == qtype:
+            return fn(x, w) if batch <= mod._GEMV_MAX_M else None
     return None
 
 
