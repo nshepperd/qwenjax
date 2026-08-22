@@ -567,10 +567,11 @@ def test_padding_vision_with_cache(
             padding_side="left",
         )
     )
+    # The attention mask only ever covers the tokens being passed in; the cache
+    # remembers which of its earlier slots were padding.
     mask = jnp.concatenate(
         [inputs1_padded["attention_mask"], inputs2_padded["attention_mask"]], axis=1
     )
-    inputs2_padded["attention_mask"] = mask
     output = jax_model(**inputs)
     output1_padded = jax_model(**inputs1_padded, use_cache=True)
     output2_padded = jax_model(

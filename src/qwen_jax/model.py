@@ -11,7 +11,7 @@ from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 from transformers import Qwen3VLConfig
 
 from . import equinox_utils as eu
-from .cache import KVCache
+from .cache import KVCache, KVPrefix
 from .config import (
     Qwen3VLConfig as Qwen3VLConfigModel,
 )
@@ -154,12 +154,14 @@ class Qwen3VLModel(eqx.Module):
         mm_token_type_ids: Int[Array, "batch seq"] | None,
         position_ids: Int[Array, "3 batch seq"] | None,
         rope_deltas: Int[Array, "batch 1"] | None,
-        cache_position: Int[Array, ""] | None,
+        past_len: Int[Array, ""] | int | None,
     ) -> tuple[Int[Array, "3 batch seq"], Int[Array, "batch 1"], Int[Array, "batch 1"]]:
         """Resolve 3D position IDs.
 
-        Returns (position_ids, prior_rope_deltas, new_rope_deltas). The two delta
-        terms are returned separately so the caller can thread/sum as needed.
+        `past_len` is how many positions precede the input: the cache position,
+        or a prefix's length. Returns (position_ids, prior_rope_deltas,
+        new_rope_deltas). The two delta terms are returned separately so the
+        caller can thread/sum as needed.
         """
         batch_size = input_ids.shape[0]
         if rope_deltas is None:
@@ -170,46 +172,31 @@ class Qwen3VLModel(eqx.Module):
                 input_ids, image_grid_thw, attention_mask, mm_token_type_ids
             )
             position_ids += rope_deltas
-            if cache_position is not None:
-                position_ids += cache_position
+            if past_len is not None:
+                position_ids += past_len
         return position_ids, rope_deltas, new_rope_deltas
 
-    def _build_attention_mask(
-        self,
-        attention_mask: Float[Array, "batch seq"] | None,
+    @staticmethod
+    def _kv_mask(
+        attention_mask: Bool[Array, "batch seq"],
         cache: KVCache | None,
-        cache_position: Int[Array, ""] | None,
-        batch_size: int,
-        seq_len: int,
-    ) -> tuple[Bool[Array, "batch 1 seq kv_seq"], Bool[Array, "batch kv_seq"]]:
-        """Build the 4-D causal+padding mask and a 2-D kv_mask for varlen attention.
+        prefix: KVPrefix | None,
+    ) -> tuple[Bool[Array, "batch kv_seq"], KVCache | None]:
+        """The mask over every key slot attention will see, and the cache with
+        the incoming tokens' validity recorded.
 
-        attention_mask defaults to all-ones when None — both downstream consumers
-        (causal mask and varlen kv_mask) require it.
+        `attention_mask` only ever describes the tokens being passed in now. A
+        cache remembers the validity of what was written before; a prefix is
+        always entirely valid.
         """
+        batch_size = attention_mask.shape[0]
         if cache is not None:
-            kv_len = cache.max_seq_len
-            past_seen_tokens = cache_position if cache_position is not None else 0
-        else:
-            kv_len = seq_len
-            past_seen_tokens = 0
-
-        q_positions = jnp.arange(seq_len) + past_seen_tokens
-        k_positions = jnp.arange(kv_len)
-        causal_mask = (k_positions[None, :] <= q_positions[:, None])[None, None, :, :]
-
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, kv_len), dtype=jnp.int32)
-        elif attention_mask.shape[-1] < kv_len:
-            attention_mask = jnp.pad(
-                attention_mask,
-                ((0, 0), (0, kv_len - attention_mask.shape[-1])),
-                constant_values=1,
-            )
-
-        kv_mask = attention_mask[:, :kv_len].astype(jnp.bool)
-        causal_mask = causal_mask & kv_mask[:, None, None, :]
-        return causal_mask, kv_mask
+            cache = cache.mark(attention_mask)
+            return cache.valid, cache
+        if prefix is not None:
+            ones = jnp.ones((batch_size, prefix.length), dtype=jnp.bool)
+            return jnp.concatenate([ones, attention_mask], axis=1), None
+        return attention_mask, None
 
     def __call__(
         self,
@@ -222,36 +209,51 @@ class Qwen3VLModel(eqx.Module):
         cache_position: Int[Array, ""] | None = None,
         rope_deltas: Int[Array, "batch 1"] | None = None,
         mm_token_type_ids: Int[Array, "batch seq"] | None = None,
+        prefix: KVPrefix | None = None,
     ) -> tuple[Float[Array, "batch seq hidden"], KVCache | None, Int[Array, "batch 1"]]:
         """Forward pass.
+
+        `attention_mask` is (batch, seq) over `input_ids` only -- never over the
+        cache's capacity. `prefix` is attended ahead of the input (see
+        `KVPrefix`); it is exclusive with `cache`.
 
         Returns:
             (hidden_states, new_cache, rope_deltas) tuple
         """
         batch_size, seq_len = input_ids.shape
+        if cache is not None and prefix is not None:
+            raise ValueError("pass either a cache or a prefix, not both")
+        if attention_mask is None:
+            attention_mask = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+        if attention_mask.shape != (batch_size, seq_len):
+            raise ValueError(
+                f"attention_mask {attention_mask.shape} must match input_ids "
+                f"{(batch_size, seq_len)}: it describes the new tokens only"
+            )
 
         inputs_embeds, visual_pos_masks, deepstack_visual_embeds = self._splice_image_embeds(
             input_ids, pixel_values, image_grid_thw, mm_token_type_ids,
         )
 
+        past_len: Int[Array, ""] | int | None = cache_position
+        if past_len is None and prefix is not None:
+            past_len = prefix.length
         position_ids, rope_deltas, new_rope_deltas = self._resolve_position_ids(
             input_ids, image_grid_thw, attention_mask, mm_token_type_ids,
-            position_ids, rope_deltas, cache_position,
+            position_ids, rope_deltas, past_len,
         )
 
-        causal_mask, kv_mask = self._build_attention_mask(
-            attention_mask, cache, cache_position, batch_size, seq_len,
-        )
+        kv_mask, cache = self._kv_mask(attention_mask.astype(jnp.bool), cache, prefix)
 
         hidden_states, new_cache = self.language_model(
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
-            attention_mask=causal_mask,
+            kv_mask=kv_mask,
             cache=cache,
             cache_position=cache_position,
+            prefix=prefix,
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
-            kv_mask=kv_mask,
         )
 
         return hidden_states, new_cache, (rope_deltas + new_rope_deltas)
@@ -318,10 +320,17 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
         use_cache: bool = False,
         mm_token_type_ids: Int[Array, "batch seq"] | None = None,
         last_logit_only: bool = False,
+        prefix: KVPrefix | None = None,
     ) -> Qwen3VLOutput:
         """Forward pass.
 
         Args:
+            attention_mask: (batch, seq) padding mask over ``input_ids`` only.
+            cache: KV cache to read from and write into. Its own ``valid`` mask
+                covers everything written earlier.
+            prefix: K/V attended ahead of the input (a cartridge, say). With
+                ``use_cache`` and no cache, the new cache is seeded with it;
+                otherwise it is concatenated in each layer.
             last_logit_only: If True, skip the full lm_head projection over the
                 prompt and only compute logits at the last non-padded position
                 per batch item — populates ``Qwen3VLOutput.last_logits`` and
@@ -332,20 +341,12 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
             logits (full) or last_logits ((batch, vocab)) depending on the flag.
         """
         if use_cache and cache is None:
-            batch_size = input_ids.shape[0]
-            max_seq_len = input_ids.shape[1]
-            text_config = self.model.config.text_config
-            cache_dtype = self.model.language_model.embed_tokens.weight().dtype
-            if cache_dtype == jnp.float32:
-                cache_dtype = jnp.bfloat16
-            cache = KVCache.create(
-                num_layers=text_config.num_hidden_layers,
-                batch_size=batch_size,
-                max_seq_len=max_seq_len,
-                num_kv_heads=text_config.num_key_value_heads,
-                head_dim=text_config.head_dim,
-                dtype=cache_dtype,
+            cache_dtype = self.cache_dtype()
+            cache = KVCache.for_model(
+                self, input_ids.shape[0], input_ids.shape[1],
+                dtype=cache_dtype, prefix=prefix,
             )
+            prefix = None
 
         hidden_states, new_cache, new_rope_deltas = self.model(
             input_ids=input_ids,
@@ -357,15 +358,15 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
             cache_position=cache.position if cache is not None else None,
             rope_deltas=rope_deltas,
             mm_token_type_ids=mm_token_type_ids,
+            prefix=prefix,
         )
 
         if last_logit_only:
             batch_size, seq_len = input_ids.shape
             if attention_mask is not None:
-                mask_slice = attention_mask[:, :seq_len]
                 positions = jnp.arange(seq_len)
                 last_idx = jnp.max(
-                    positions[None, :] * (mask_slice == 1).astype(jnp.int32),
+                    positions[None, :] * (attention_mask == 1).astype(jnp.int32),
                     axis=-1,
                 )
             else:
@@ -388,6 +389,11 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
             rope_deltas=new_rope_deltas,
         )
 
+    def cache_dtype(self):
+        """The dtype K/V are cached in: the model's, except never float32."""
+        dtype = self.model.language_model.embed_tokens.weight().dtype
+        return jnp.bfloat16 if dtype == jnp.float32 else dtype
+
     @pjit(static_argnames=("max_new_tokens", "progress_bar", "return_logits"))
     def generate(
         self,
@@ -397,6 +403,7 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
         attention_mask: Float[Array, "batch seq"] | None = None,
         *,
         cache: KVCache | None = None,
+        prefix: KVPrefix | None = None,
         rope_deltas: Int[Array, "batch 1"] | None = None,
         max_new_tokens: int,
         key: PRNGKeyArray,
@@ -414,6 +421,9 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
             pixel_values: Image patches (required if images in prompt).
             image_grid_thw: Grid dimensions for each image (T, H, W).
             attention_mask: Padding mask for prompt (batch, seq).
+            cache: A cache to continue from. Created if absent.
+            prefix: K/V to attend ahead of the prompt, e.g. a cartridge. Written
+                into the cache before the prefill.
             max_new_tokens: Number of tokens to generate.
             key: PRNG key for sampling.
             temperature: Sampling temperature (0 = greedy).
@@ -425,29 +435,18 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
         batch_size = input_ids.shape[0]
         prompt_len = input_ids.shape[1]
         max_seq_len = prompt_len + max_new_tokens
-        text_config = self.model.config.text_config
-
-        # === Step 1: Compute position IDs for prefill (handles images) ===
 
         # === Step 2: Create KV cache ===
         if cache is None:
-            cache = KVCache.create(
-                num_layers=text_config.num_hidden_layers,
-                batch_size=batch_size,
-                max_seq_len=max_seq_len,
-                num_kv_heads=text_config.num_key_value_heads,
-                head_dim=text_config.head_dim,
-                dtype=jnp.bfloat16,
+            cache = KVCache.for_model(
+                self, batch_size, max_seq_len, dtype=jnp.bfloat16, prefix=prefix,
             )
+        elif prefix is not None:
+            cache = cache.write_prefix(prefix)
 
         if attention_mask is None:
-            attention_mask = jnp.ones([batch_size, max_seq_len], dtype=jnp.int32)
-        elif attention_mask.shape[1] < max_seq_len:
-            attention_mask = jnp.pad(
-                attention_mask,
-                ((0, 0), (0, max_seq_len - attention_mask.shape[1])),
-                constant_values=1,
-            )
+            attention_mask = jnp.ones([batch_size, prompt_len], dtype=jnp.int32)
+        decode_mask = jnp.ones([batch_size, 1], dtype=jnp.int32)
 
         # === Step 3: Prefill - process entire prompt with images ===
         # last_logit_only skips the lm_head matmul over the full prompt and only
@@ -496,7 +495,7 @@ class Qwen3VLForConditionalGeneration(eqx.Module):
                 input_ids=token[:, None],
                 pixel_values=None,
                 image_grid_thw=None,
-                attention_mask=attention_mask,
+                attention_mask=decode_mask,
                 cache=cache,
                 rope_deltas=output.rope_deltas,
             )

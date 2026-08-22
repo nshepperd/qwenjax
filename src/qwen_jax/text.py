@@ -10,7 +10,7 @@ from jaxtyping import Array, Bool, Float, Int
 from qwen_jax.config import Qwen3VLTextConfig
 
 from .attention import Qwen3VLTextAttention
-from .cache import KVCache, KVCacheLayer
+from .cache import KVCache, KVCacheLayer, KVPrefix
 from .linear import Embedding, RMSNorm
 from .mlp import Qwen3VLTextMLP
 from .rope import Qwen3VLTextRotaryEmbedding
@@ -39,33 +39,23 @@ class Qwen3VLTextDecoderLayer(eqx.Module):
         self,
         hidden_states: Float[Array, "batch seq hidden"],
         position_embeddings: tuple[Float[Array, "batch seq head_dim"], Float[Array, "batch seq head_dim"]],
-        attention_mask: Float[Array, "batch 1 seq kv_seq"] | None = None,
+        *,
+        kv_mask: Bool[Array, "batch kv_seq"],
         cache: KVCacheLayer | None = None,
         cache_position: Int[Array, ""] | None = None,
-        kv_mask: Bool[Array, "batch kv_seq"] | None = None,
+        prefix: KVCacheLayer | None = None,
     ) -> tuple[Float[Array, "batch seq hidden"], KVCacheLayer | None]:
-        """Forward pass.
-
-        Args:
-            hidden_states: Input (batch, seq, hidden)
-            position_embeddings: (cos, sin) from MRoPE
-            attention_mask: Causal attention mask
-            cache: Optional KV cache layer
-            cache_position: Position in cache
-
-        Returns:
-            (output, new_cache) tuple
-        """
+        """Forward pass. See `Qwen3VLTextAttention.__call__` for the KV arguments."""
         # Pre-norm self-attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states, new_cache = self.self_attn(
             hidden_states,
             position_embeddings=position_embeddings,
-            attention_mask=attention_mask,
+            kv_mask=kv_mask,
             cache=cache,
             cache_position=cache_position,
-            kv_mask=kv_mask,
+            prefix=prefix,
         )
         hidden_states = residual + hidden_states
 
@@ -139,18 +129,17 @@ class Qwen3VLTextModel(eqx.Module):
         )
         return hidden_states
 
-    # @jax.remat
     def __call__(
         self,
         input_ids: Int[Array, "batch seq"] | None = None,
         inputs_embeds: Float[Array, "batch seq hidden"] | None = None,
         position_ids: Int[Array, "3 batch seq"] | None = None,
-        attention_mask: Float[Array, "batch 1 seq kv_seq"] | None = None,
+        kv_mask: Bool[Array, "batch kv_seq"] | None = None,
         cache: KVCache | None = None,
         cache_position: Int[Array, ""] | None = None,
+        prefix: KVPrefix | None = None,
         visual_pos_masks: Float[Array, "batch seq"] | None = None,
         deepstack_visual_embeds: tuple[Float[Array, "..."], ...] | None = None,
-        kv_mask: Bool[Array, "batch kv_seq"] | None = None,
     ) -> tuple[Float[Array, "batch seq hidden"], KVCache | None]:
         """Forward pass.
 
@@ -158,9 +147,13 @@ class Qwen3VLTextModel(eqx.Module):
             input_ids: Token IDs (batch, seq). Either this or inputs_embeds required.
             inputs_embeds: Pre-computed embeddings (batch, seq, hidden)
             position_ids: 3D position IDs for MRoPE (3, batch, seq)
-            attention_mask: Causal mask (batch, 1, seq, kv_seq)
-            cache: Optional KV cache
+            kv_mask: Which key slots hold real tokens, over the full key
+                sequence (cache capacity, prefix + input, or input). Defaults
+                to everything valid.
+            cache: Optional KV cache. Its `valid` mask is *not* consulted here --
+                the caller folds it into kv_mask (see `Qwen3VLModel`).
             cache_position: Position in cache
+            prefix: Optional KV prefix attended to ahead of the input.
             visual_pos_masks: Boolean mask for visual token positions (batch, seq)
             deepstack_visual_embeds: Tuple of visual embeddings for DeepStack
 
@@ -172,14 +165,22 @@ class Qwen3VLTextModel(eqx.Module):
 
         batch_size, seq_len, _ = inputs_embeds.shape
 
+        if cache is not None and prefix is not None:
+            raise ValueError("pass either a cache or a prefix, not both")
+        past_len: Int[Array, ""] | int = 0
+        if cache_position is not None:
+            past_len = cache_position
+        elif prefix is not None:
+            past_len = prefix.length
+
         # Handle position IDs
         if position_ids is None:
-            if cache_position is not None:
-                # Use cache position for all 3 dimensions
-                pos = jnp.arange(seq_len) + cache_position
-            else:
-                pos = jnp.arange(seq_len)
+            pos = jnp.arange(seq_len) + past_len
             position_ids = jnp.broadcast_to(pos[None, None, :], (3, batch_size, seq_len))
+
+        if kv_mask is None:
+            kv_len = cache.max_seq_len if cache is not None else seq_len + int(past_len)
+            kv_mask = jnp.ones((batch_size, kv_len), dtype=jnp.bool)
 
         # Compute position embeddings (MRoPE)
         position_embeddings = self.rotary_emb(position_ids)
@@ -191,14 +192,15 @@ class Qwen3VLTextModel(eqx.Module):
         new_cache_layers = []
         for layer_idx, layer in enumerate(self.layers):
             layer_cache = cache.layers[layer_idx] if cache is not None else None
+            layer_prefix = prefix.layer(layer_idx) if prefix is not None else None
 
             hidden_states, new_layer_cache = layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
-                attention_mask=attention_mask,
+                kv_mask=kv_mask,
                 cache=layer_cache,
                 cache_position=cache_position,
-                kv_mask=kv_mask,
+                prefix=layer_prefix,
             )
 
             if new_layer_cache is not None:
@@ -217,8 +219,11 @@ class Qwen3VLTextModel(eqx.Module):
         # Build new cache
         new_cache = None
         if cache is not None:
-            new_position = cache.position + seq_len
-            new_cache = KVCache(layers=tuple(new_cache_layers), position=new_position)
+            new_cache = KVCache(
+                layers=tuple(new_cache_layers),
+                position=cache.position + seq_len,
+                valid=cache.valid,
+            )
 
         return hidden_states, new_cache
 

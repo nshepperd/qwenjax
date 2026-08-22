@@ -608,7 +608,7 @@ wheels = [
 [[package]]
 name = "fa4-jax"
 version = "0.1.0"
-source = { git = "https://github.com/nshepperd/fa4-jax.git?rev=main#667bec3627a19aad6eeffeb55428ce771ab86125" }
+source = { git = "https://github.com/nshepperd/fa4-jax.git?rev=main#b71f00f9b139eaa8c3cd0f8e1b28869a58d1713d" }
 dependencies = [
     { name = "cutejax" },
     { name = "jax", extra = ["cuda12"] },

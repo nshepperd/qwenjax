@@ -280,14 +280,10 @@ def chunk_logprobs_decode(model, chunk: np.ndarray) -> np.ndarray:
     """
     from qwen_jax.cache import KVCache
 
-    cfg = model.model.config.text_config
     seq = len(chunk)
     input_ids = jnp.asarray(chunk)[None, :]
-    mask = jnp.ones((1, seq + 1), jnp.int32)
-    cache = KVCache.create(
-        num_layers=cfg.num_hidden_layers, batch_size=1, max_seq_len=seq + 1,
-        num_kv_heads=cfg.num_key_value_heads, head_dim=cfg.head_dim,
-        dtype=jnp.bfloat16)
+    mask = jnp.ones((1, 1), jnp.int32)
+    cache = KVCache.for_model(model, batch_size=1, max_seq_len=seq + 1)
 
     @jax.jit
     def step(model, cache, token, rope_deltas):
