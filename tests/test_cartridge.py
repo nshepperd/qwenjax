@@ -212,7 +212,7 @@ def test_save_load_roundtrip(model, tokens, tmp_path):
     np.testing.assert_array_equal(np.asarray(back.keys), np.asarray(cart.keys))
     np.testing.assert_array_equal(np.asarray(back.values), np.asarray(cart.values))
     np.testing.assert_array_equal(np.asarray(back.trainable), np.asarray(cart.trainable))
-    assert back.meta == cart.meta and back.meta.steps == 3
+    assert back.meta == cart.meta and int(back.steps) == 3
 
 
 def test_distillation_step(model, tokenizer, tokens):
@@ -242,7 +242,7 @@ def test_distillation_step(model, tokenizer, tokens):
     for _ in range(6):
         c, state, loss = trainer.step(model, c, state, batch)
         losses.append(float(loss))
-    assert c.meta.steps == 6
+    assert int(c.steps) == 6
     assert losses[-1] < losses[0], losses
     np.testing.assert_array_equal(np.asarray(c.keys[:, 0]), np.asarray(cart.keys[:, 0]))
     np.testing.assert_array_equal(np.asarray(c.values[:, 0]), np.asarray(cart.values[:, 0]))

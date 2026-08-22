@@ -43,8 +43,6 @@ class CartridgeMeta:
     """How many corpus tokens the initialisation ran over (== p)."""
     description: str = ""
     """The text prepended to the corpus in the system prompt, if any."""
-    steps: int = 0
-    """Training steps applied so far."""
 
     def to_json(self) -> str:
         return json.dumps(dataclasses.asdict(self))
@@ -63,6 +61,9 @@ class Cartridge(eqx.Module):
     values: Float[Array, "layers p kv_heads head_dim"]
     trainable: Bool[Array, "p"]
     meta: CartridgeMeta = eqx.field(static=True)
+    # An array, not a static int: a static field is part of jit's cache key,
+    # and a step counter that changes every step would recompile every step.
+    steps: Int[Array, ""] = dataclasses.field(default_factory=lambda: jnp.array(0, jnp.int32))
 
     @property
     def length(self) -> int:
@@ -142,7 +143,7 @@ class Cartridge(eqx.Module):
         return (grads[0] * m, grads[1] * m)
 
     def advance(self, steps: int) -> Cartridge:
-        return eu.replace(self, meta=dataclasses.replace(self.meta, steps=self.meta.steps + steps))
+        return eu.replace(self, steps=self.steps + steps)
 
     # --- persistence -------------------------------------------------------
 
@@ -150,7 +151,8 @@ class Cartridge(eqx.Module):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         st.save_file(
-            {"keys": self.keys, "values": self.values, "trainable": self.trainable},
+            {"keys": self.keys, "values": self.values, "trainable": self.trainable,
+             "steps": self.steps},
             str(path),
             metadata={"cartridge": self.meta.to_json()},
         )
@@ -169,6 +171,7 @@ class Cartridge(eqx.Module):
             values=jnp.asarray(tensors["values"], dtype=jnp.float32),
             trainable=jnp.asarray(tensors["trainable"], dtype=jnp.bool),
             meta=meta,
+            steps=jnp.asarray(tensors.get("steps", 0), dtype=jnp.int32),
         )
 
 
