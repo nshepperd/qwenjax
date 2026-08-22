@@ -114,6 +114,22 @@ def batches_from(tokenizer, examples, args, *, shuffle: bool, seed: int = 0):
                          seq=args.seq, pad_id=tokenizer.pad_token_id)
 
 
+def wsd_schedule(peak: float, steps: int, *, warmup: int, decay_frac: float):
+    """Warmup-stable-decay: linear warmup, constant, then linear decay to 0."""
+    import optax
+
+    decay = int(round(steps * decay_frac))
+    stable = max(steps - warmup - decay, 0)
+    return optax.join_schedules(
+        [
+            optax.linear_schedule(0.0, peak, warmup),
+            optax.constant_schedule(peak),
+            optax.linear_schedule(peak, 0.0, decay),
+        ],
+        boundaries=[warmup, warmup + stable],
+    )
+
+
 def cmd_train(args):
     import optax
 
@@ -138,18 +154,15 @@ def cmd_train(args):
     held = list(batches_from(tokenizer, heldout, args, shuffle=False)) if heldout else []
     log = []
 
-    def report(step, loss):
+    def report(step, loss, eval=True):
         row = {"step": step, "loss": loss, "time": time.time() - t0}
-        if held:
+        if held and eval:
             row["heldout"] = evaluate(model, cart, held, block=args.block)
         log.append(row)
         print("  ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
                         for k, v in row.items()), flush=True)
 
-    schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0, peak_value=args.lr, warmup_steps=min(20, args.steps // 10),
-        decay_steps=args.steps, end_value=args.lr * 0.1,
-    )
+    schedule = wsd_schedule(args.lr, args.steps, warmup=args.warmup, decay_frac=args.decay_frac)
     trainer = Trainer(optax.adam(schedule), block=args.block)
     state = trainer.init(cart)
     t0 = time.time()
@@ -164,7 +177,8 @@ def cmd_train(args):
             recent.append(float(loss))
             step += 1
             if step % args.log_every == 0 or step == args.steps:
-                report(step, float(np.mean(recent)))
+                report(step, float(np.mean(recent)),
+                       eval=step % args.eval_every == 0 or step == args.steps)
                 recent = []
             if step % args.save_every == 0:
                 cart.save(args.out)
@@ -268,7 +282,11 @@ def main():
     t.add_argument("--p", type=int, default=1024)
     t.add_argument("--steps", type=int, default=300)
     t.add_argument("--lr", type=float, default=5e-3)
+    t.add_argument("--warmup", type=int, default=20)
+    t.add_argument("--decay-frac", type=float, default=0.2,
+                   help="fraction of steps spent decaying linearly to 0 (WSD)")
     t.add_argument("--log-every", type=int, default=10)
+    t.add_argument("--eval-every", type=int, default=50)
     t.add_argument("--save-every", type=int, default=50)
     t.add_argument("--resume")
     t.add_argument("--out", required=True)
