@@ -97,7 +97,7 @@ def init_cartridge(model, tokenizer, corpus, p: int, description: str):
     from qwen_jax.cartridge import Cartridge, CartridgeMeta
 
     head = tokenizer.encode(chat.system_open(f"{description}\n\n"), add_special_tokens=False)
-    ids = np.concatenate([np.asarray(head, np.int32), corpus.head(p - len(head))])
+    ids = np.concatenate([np.asarray(head, np.int32), corpus.head(max(p - len(head), 0))])
     meta = CartridgeMeta(model=GGUF_FILE.name, init_tokens=len(ids), description=description)
     return Cartridge.init_from_tokens(model, ids, meta=meta)
 
