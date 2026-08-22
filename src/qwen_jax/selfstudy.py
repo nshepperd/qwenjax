@@ -81,41 +81,53 @@ class Corpus:
 # Seed prompts
 # -----------------------------------------------------------------------------
 
-# Generic by design: nothing here knows what the corpus is about.
-SEED_PROMPTS: dict[str, list[str]] = {
+# Generic by design: nothing here knows what the corpus is about. Each one
+# asks for the *message itself* in the user's voice -- otherwise the model
+# answers the instruction as an assistant ("Sure! Which part would you like me
+# to summarize?") and the conversation never gets going.
+_FRAME = (
+    "You are a person who has just read the document above and is about to "
+    "message an expert on it. Write that message. {task} Refer to specific "
+    "parts of the document by name. Output only the message itself, in the "
+    "first person, with no preamble, no quotation marks and no sign-off."
+)
+
+SEED_TASKS: dict[str, list[str]] = {
     "structuring": [
-        "Please start a conversation by asking me to restructure a part of the "
-        "document above into a table, list, or outline. Say exactly which part.",
-        "Begin by asking me to reorganise some specific piece of the document above "
-        "into a more structured form (a table, a numbered list, a tree). Be specific "
-        "about which piece.",
+        "Ask the expert to restructure one specific part of the document into a "
+        "table, list, or outline, and say which part.",
+        "Ask the expert to lay out one specific part of the document in a more "
+        "structured form, such as a table or a tree, and say which part.",
     ],
     "summarization": [
-        "Please start a conversation by asking me to summarise a specific section "
-        "of the document above.",
-        "Begin by asking me for a short summary of one particular part of the "
-        "document above, naming the part.",
+        "Ask the expert for a summary of one specific section of the document.",
+        "Ask the expert to explain in a few sentences what one specific part of "
+        "the document does and why.",
     ],
     "question": [
-        "Please start a conversation by asking me a specific, detailed question "
-        "about the document above -- one that can be answered from it.",
-        "Ask me one precise factual question whose answer is in the document above. "
-        "Do not answer it yourself.",
-        "Ask me a question that requires understanding how two parts of the document "
-        "above relate to each other.",
+        "Ask the expert one precise, detailed question whose answer is in the "
+        "document.",
+        "Ask the expert one factual question about a specific detail in the "
+        "document.",
+        "Ask the expert a question about how two parts of the document relate to "
+        "each other.",
     ],
     "use_case": [
-        "Please start a conversation by asking me how the material in the document "
-        "above could be used or applied to a concrete task.",
-        "Begin by asking me a practical question: how would someone use what is "
-        "described in the document above to get something done?",
+        "Ask the expert how the material in the document could be used to "
+        "accomplish a concrete task you describe.",
+        "Describe something practical you want to do and ask the expert how the "
+        "document's contents would help you do it.",
     ],
     "creative": [
-        "Please start a conversation by asking me to explain something from the "
-        "document above by analogy, or to a particular audience.",
-        "Begin by asking me to critique, compare, or propose an alternative to "
-        "something described in the document above.",
+        "Ask the expert to explain one thing from the document by analogy, or to "
+        "a particular audience you name.",
+        "Ask the expert to critique or propose an alternative to one specific "
+        "design choice in the document.",
     ],
+}
+
+SEED_PROMPTS: dict[str, list[str]] = {
+    kind: [_FRAME.format(task=t) for t in tasks] for kind, tasks in SEED_TASKS.items()
 }
 
 
@@ -267,6 +279,7 @@ def self_study(
 
 __all__ = [
     "SEED_PROMPTS",
+    "SEED_TASKS",
     "Corpus",
     "Example",
     "generate_batch",

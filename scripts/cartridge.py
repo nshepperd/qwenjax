@@ -83,7 +83,7 @@ def cmd_gen(args):
         key=jax.random.key(args.seed), seed=args.seed, batch_size=args.batch,
         chunk_tokens=(args.chunk_min, args.chunk_max),
         max_user_tokens=args.max_user, max_assistant_tokens=args.max_assistant,
-        temperature=args.temperature,
+        temperature=args.temperature, progress=progress,
     )
     save_examples(examples, args.out)
     print(f"wrote {len(examples)} examples to {args.out}")
