@@ -1,11 +1,13 @@
 """Attention layers for Qwen3-VL."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 from einops import rearrange
-from flash_attn_jax.varlen import flash_mha_varlen
+from fa4_jax import MaskMod, document_mask, flash_attn
 from jaxtyping import Array, Bool, Float, Int
 
 from qwen_jax.config import Qwen3VLTextConfig
@@ -14,6 +16,24 @@ from . import attention_xla as axla
 from .cache import KVCacheLayer
 from .linear import Linear, RMSNorm
 from .rope import apply_rotary_pos_emb, apply_rotary_pos_emb_vision
+
+
+@dataclass(frozen=True)
+class PaddedCausalMask(MaskMod):
+    """Causal attention over a padded key sequence.
+
+    A query at absolute position ``offset[b] + q_idx`` attends a key when the
+    key is unpadded and does not come after it -- the flash-kernel form of
+    `attention_xla.causal_mask`. Both fields are runtime data (int32, since the
+    kernel codegen indexes them as tensors), so every prompt shape and cache
+    position reuses one compiled kernel.
+    """
+
+    key_valid: Int[Array, "batch kv_seq"]
+    offset: Int[Array, "batch"]
+
+    def __call__(self, b, h, q_idx, kv_idx):
+        return (kv_idx <= q_idx + self.offset[b]) & (self.key_valid[b, kv_idx] != 0)
 
 
 class Qwen3VLVisionAttention(eqx.Module):
@@ -74,32 +94,27 @@ class Qwen3VLVisionAttention(eqx.Module):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
-        # flash_mha_varlen expects (total_seq, heads, head_dim) - no batch dimension
-        # q, k, v are already (seq, heads, head_dim)
-
-        # flash_mha_varlen requires float16 or bfloat16
+        # The flash kernel requires float16 or bfloat16
         orig_dtype = q.dtype
         if orig_dtype == jnp.float32 and axla.use_flash():
             q = q.astype(jnp.float16)
             k = k.astype(jnp.float16)
             v = v.astype(jnp.float16)
 
-        # Compute max sequence length for flash attention
-        max_seqlen = hidden_states.shape[0]
-
         if axla.use_flash():
-            # Variable-length flash attention
-            attn_output = flash_mha_varlen(
-                q,
-                k,
-                v,
-                seqlens_q=cu_seqlens,
-                seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                softmax_scale=self.head_dim**-0.5,
-                is_causal=False,
-            )
+            # Packed sequences attend block-diagonally: a token's segment is
+            # how many cu_seqlens boundaries precede it (same relation as
+            # axla.segment_mask), expressed as a document id per token.
+            pos = jnp.arange(seq_len, dtype=jnp.int32)
+            segment = jnp.searchsorted(cu_seqlens, pos, side="right").astype(jnp.int32)
+            attn_output = flash_attn(
+                q[None],
+                k[None],
+                v[None],
+                mask_mod=document_mask(segment[None]),
+                scale=self.head_dim**-0.5,
+                backend="cute",
+            )[0]
         else:
             attn_output = axla.masked_attention(
                 q, k, v,
@@ -247,54 +262,30 @@ class Qwen3VLTextAttention(eqx.Module):
                 )
             attn_output = jax.vmap(axla.masked_attention)(q, k, v, mask)
         elif kv_mask is not None and cache is None:
-            # no cache and we have mask. use varlen attn
+            # Prefill without a cache: queries and keys share positions, so
+            # the kernel's native causal path (which skips future KV blocks)
+            # does the causality and the mask mod only drops padded keys.
             assert kv_mask.shape == (batch_size, seq_len)
-
-            def varlen_fwd(q, k, v, kv_mask):
-                # idx: [seq_len] = index such that kv_mask[idx] has all the 1s at the front
-                idx = jnp.argsort(~kv_mask, stable=True, axis=0)
-                vlen = jnp.sum(kv_mask, axis=0, dtype=jnp.int32)
-                q = q[idx]  # s h d
-                k = k[idx]  # s h d
-                v = v[idx]  # s h d
-                # staggered seqlens produces sparsity without needing seqused_k
-                seqlens_q = jnp.array([0, vlen, vlen, seq_len], dtype=jnp.int32)
-                seqlens_k = jnp.array([0, vlen, seq_len, seq_len], dtype=jnp.int32)
-                o = flash_mha_varlen(q, k, v, seqlens_q, seqlens_k, is_causal=True)
-                inv_idx = jnp.argsort(idx, axis=0)
-                o = o[inv_idx]
-                return o
-
-            attn_output = jax.vmap(varlen_fwd)(q, k, v, kv_mask)
+            mask = PaddedCausalMask(
+                key_valid=kv_mask.astype(jnp.int32),
+                offset=jnp.zeros((batch_size,), jnp.int32),
+            )
+            attn_output = flash_attn(
+                q, k, v, causal=True, mask_mod=mask, backend="cute"
+            )
         elif kv_mask is not None and cache is not None:
+            # Queries sit at cache_position.. within the cache, which is not
+            # the bottom-right alignment the native causal path assumes, so
+            # the mask mod carries the offset instead. Padded and not-yet-
+            # written cache slots are both dropped by the mask: the former by
+            # kv_mask, the latter by causality.
             assert cache_position is not None
             assert kv_mask.shape == (batch_size, cache.keys.shape[1])
-            cache_len = cache.keys.shape[1]
-
-            def varlen_fwd(q, k, v, kv_mask):
-                assert cache_position is not None
-                kv_mask = kv_mask & (jnp.arange(cache_len) < cache_position + seq_len)
-                kv_idx = jnp.argsort(~kv_mask, stable=True, axis=0)
-                q_mask = jax.lax.dynamic_slice(
-                    kv_mask, start_indices=(cache_position,), slice_sizes=(seq_len,)
-                )
-                q_idx = jnp.argsort(~q_mask, stable=True, axis=0)
-                kvlen = kv_mask.sum(dtype=jnp.int32)
-                qlen = q_mask.sum(dtype=jnp.int32)
-                seqlens_q = jnp.array([0, qlen, qlen, seq_len])
-                seqlens_k = jnp.array([0, kvlen, cache_len, cache_len])
-                o = flash_mha_varlen(
-                    q[q_idx],
-                    k[kv_idx],
-                    v[kv_idx],
-                    seqlens_q=seqlens_q,
-                    seqlens_k=seqlens_k,
-                    is_causal=True,
-                )
-                inv_idx = jnp.argsort(q_idx, axis=0)
-                return o[inv_idx]
-
-            attn_output = jax.vmap(varlen_fwd)(q, k, v, kv_mask)
+            mask = PaddedCausalMask(
+                key_valid=kv_mask.astype(jnp.int32),
+                offset=jnp.full((batch_size,), cache_position, jnp.int32),
+            )
+            attn_output = flash_attn(q, k, v, mask_mod=mask, backend="cute")
         else:
             raise NotImplementedError(
                 "Causal attention without mask is not implemented."

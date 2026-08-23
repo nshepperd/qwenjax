@@ -10,6 +10,9 @@ resolution-markers = [
 exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
 exclude-newer-span = "P7D"
 
+[options.exclude-newer-package]
+cutejax = "2100-01-01T13:00:00Z"
+
 [manifest]
 overrides = [
     { name = "jax", extras = ["cuda12"], specifier = ">=0.8.2,<0.9.0" },
@@ -603,6 +606,18 @@ wheels = [
 ]
 
 [[package]]
+name = "fa4-jax"
+version = "0.1.0"
+source = { git = "https://github.com/nshepperd/fa4-jax.git?rev=main#667bec3627a19aad6eeffeb55428ce771ab86125" }
+dependencies = [
+    { name = "cutejax" },
+    { name = "jax", extra = ["cuda12"] },
+    { name = "jaxtyping" },
+    { name = "nvidia-cutlass-dsl" },
+    { name = "quack-kernels" },
+]
+
+[[package]]
 name = "fastcore"
 version = "2.1.20"
 source = { registry = "https://pypi.org/simple" }
@@ -618,21 +633,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/f6/57/3ba6e6cb097f85b855b00163d169f35365f44277df044dcf96d55b8f62a3/filelock-3.32.2.tar.gz", hash = "sha256:c33351e1f49cae33414acbc6d56784e6ecee82514ec90795da1161fc4836b5b8", size = 217172, upload-time = "2026-07-29T22:46:04.895Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c1/e8/72f8cef9fdfeffe06213fe8508039396ee48daa0e3259457ed766173bfd6/filelock-3.32.2-py3-none-any.whl", hash = "sha256:87dd94cf281e586d135fa51132b8e3d9a598b316e90377a288663c9321036c82", size = 98830, upload-time = "2026-07-29T22:46:03.52Z" },
-]
-
-[[package]]
-name = "flash-attn-jax"
-version = "0.6.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "jax", extra = ["cuda12"] },
-    { name = "nanobind" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/9a/ff/44db680d6de147102176b46a3922ad136cc19476dacbc29df7d727cc0c01/flash_attn_jax-0.6.2.tar.gz", hash = "sha256:15a260db6692804d7a2995eba35737fd324e73320a1a9742c121dc64b9969485", size = 23341444, upload-time = "2026-02-28T23:40:01.721Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/6d/c2/9383d1d92bcf3ff7e1b02a51b802ac6c066c4085608e9d79725d4f4890a7/flash_attn_jax-0.6.2-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b260d07d2747c8cefd32fb123e5daf5da922474849f8aa2680add001b5b1bb8d", size = 77152417, upload-time = "2026-02-28T23:39:45.714Z" },
-    { url = "https://files.pythonhosted.org/packages/4d/a7/84e6ca7947d7264c0e762b4dd4ad3d14ab9e79ec5da6859b326983e788c9/flash_attn_jax-0.6.2-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:cd3ab0a53254ec3e13662b9258f4729e07e8cabe11e5f0bf4e9b37b0c2e70169", size = 77152268, upload-time = "2026-02-28T23:39:50.609Z" },
-    { url = "https://files.pythonhosted.org/packages/cc/cb/70cf98f22fe11a81fdf635f666f586300e5f6a09456a0de73a8339182486/flash_attn_jax-0.6.2-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b040f1635ed831bf070ca6a9d5f19aeae3d69a988a1815cb198a366ca76be71f", size = 77152511, upload-time = "2026-02-28T23:39:57.72Z" },
 ]
 
 [[package]]
@@ -703,7 +703,7 @@ wheels = [
 [[package]]
 name = "gguf-jax"
 version = "0.1.0"
-source = { editable = "../gguf-jax" }
+source = { git = "https://github.com/nshepperd/gguf-jax.git?rev=main#b2e139b179ce7e306a8a06df5548186d22f64322" }
 dependencies = [
     { name = "cutejax" },
     { name = "gguf" },
@@ -711,25 +711,6 @@ dependencies = [
     { name = "jax-tvm-ffi" },
     { name = "numpy" },
     { name = "nvidia-cutlass-dsl" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "cutejax", git = "https://github.com/nshepperd/cutejax" },
-    { name = "cutejax", extras = ["cu13"], marker = "extra == 'cu13'" },
-    { name = "gguf", specifier = ">=0.19.0" },
-    { name = "jax", specifier = ">=0.11.0" },
-    { name = "jax-tvm-ffi", specifier = ">=0.1.3" },
-    { name = "numpy", specifier = ">=2.5.1" },
-    { name = "nvidia-cutlass-dsl", specifier = ">=4.7.0" },
-]
-provides-extras = ["cu13"]
-
-[package.metadata.requires-dev]
-test = [
-    { name = "jax", extras = ["cuda13"], specifier = ">=0.11.0" },
-    { name = "nvidia-cutlass-dsl", extras = ["cu13"], specifier = ">=4.7.0" },
-    { name = "pytest", specifier = ">=9.1.1" },
 ]
 
 [[package]]
@@ -1477,15 +1458,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/e0/47/dd32fa426cc72114383ac549964eecb20ecfd886d1e5ccf5340b55b02f57/mpmath-1.3.0.tar.gz", hash = "sha256:7a28eb2a9774d00c7bc92411c19a89209d5da7c4c9a9e227be8330a23a25b91f", size = 508106, upload-time = "2023-03-07T16:47:11.061Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/43/e3/7d92a15f894aa0c9c4b49b8ee9ac9850d6e63b03c9c32c0367a13ae62209/mpmath-1.3.0-py3-none-any.whl", hash = "sha256:a0b2b9fe80bbcd81a6647ff13108738cfb482d481d826cc0e02f5b35e5c88d2c", size = 536198, upload-time = "2023-03-07T16:47:09.197Z" },
-]
-
-[[package]]
-name = "nanobind"
-version = "2.13.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/07/e5/a6fc2f024eaef17c68b94b5f8f56098d31859a7840a11a3dd45da2d3908a/nanobind-2.13.0.tar.gz", hash = "sha256:c7b04d6a6a4cd57985571e605539399b51331ae455d7fce576a5e2fcb89b1dcf", size = 1052101, upload-time = "2026-06-18T06:03:49.491Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/39/8d/cec69a0a804711fd89f47fad92cd2a438a1ceaafd9dabaf3b8b403b5cbba/nanobind-2.13.0-py3-none-any.whl", hash = "sha256:9268d7201eaf5519ae61b7a83175f2af77088cb4b99dd3ce5b00550f697da7b7", size = 269387, upload-time = "2026-06-18T06:03:47.508Z" },
 ]
 
 [[package]]
@@ -2425,6 +2397,22 @@ wheels = [
 ]
 
 [[package]]
+name = "quack-kernels"
+version = "0.5.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "apache-tvm-ffi" },
+    { name = "einops" },
+    { name = "nvidia-cutlass-dsl" },
+    { name = "torch" },
+    { name = "torch-c-dlpack-ext" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e1/94/ee76e3a3dc74d986b7b24c5928f1d14b01bd5152375688c2ede369f6d19b/quack_kernels-0.5.0.tar.gz", hash = "sha256:c7c7338b67243397b6ca166e648bba161076e99f3858b532e1c877dcc6eaa03d", size = 366426, upload-time = "2026-05-29T05:00:25.985Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2d/2b/a8f171d5e172880885571bf89e93204aaf231a0e92c4c84714eaf18c271a/quack_kernels-0.5.0-py3-none-any.whl", hash = "sha256:08821ebfb8e638cc20308d5c59410c6dbb3b637ccc7b07bd57c7a9261a06af74", size = 327709, upload-time = "2026-05-29T05:00:24.679Z" },
+]
+
+[[package]]
 name = "qwen-jax"
 version = "0.1.0"
 source = { editable = "." }
@@ -2432,7 +2420,7 @@ dependencies = [
     { name = "bitsandbytes-jax" },
     { name = "einops" },
     { name = "equinox" },
-    { name = "flash-attn-jax" },
+    { name = "fa4-jax" },
     { name = "gguf-jax" },
     { name = "jax", extra = ["cuda12"] },
     { name = "jax-tqdm" },
@@ -2463,9 +2451,9 @@ requires-dist = [
     { name = "bitsandbytes-jax", git = "https://github.com/nshepperd/bitsandbytes-jax.git?rev=main" },
     { name = "einops" },
     { name = "equinox", specifier = ">=0.13.8" },
-    { name = "flash-attn-jax", specifier = "==0.6.2" },
-    { name = "gguf-jax", editable = "../gguf-jax" },
-    { name = "jax", extras = ["cuda12"], specifier = ">=0.8.2" },
+    { name = "fa4-jax", git = "https://github.com/nshepperd/fa4-jax.git?rev=main" },
+    { name = "gguf-jax", git = "https://github.com/nshepperd/gguf-jax.git?rev=main" },
+    { name = "jax", specifier = ">=0.8.2" },
     { name = "jax-tqdm" },
     { name = "pydantic" },
     { name = "transformers", specifier = ">=5.3.0" },
@@ -2827,6 +2815,29 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/69/d1/491e3a0389430946145888b0203f2b6a759ce2a61481b96a85c2da4f2ced/torch-2.13.0-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:31061ff56ed8fbf26c749806905aeb749ebeb819810fd5d52508aa5afd90dddc", size = 427219769, upload-time = "2026-07-08T16:02:31.18Z" },
     { url = "https://files.pythonhosted.org/packages/9a/1d/38006e045bf0a1fc28ef01e757c554e59e59a8770c284bc4f47b14e60441/torch-2.13.0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:cc26eead4cf51d0b544e31e364dcf000846549c273bd148936fe9d24d29acb92", size = 526571320, upload-time = "2026-07-08T16:01:59.348Z" },
     { url = "https://files.pythonhosted.org/packages/56/94/655c91992a882bd5071aa0b5d22a07dbb130d801e872be97c0b627a7c693/torch-2.13.0-cp314-cp314t-win_amd64.whl", hash = "sha256:a7de8a313090dc5c7d7ba4bfe5c3be222528f9a4dba1acc83bddb1157360c4b8", size = 122306773, upload-time = "2026-07-08T16:02:39.832Z" },
+]
+
+[[package]]
+name = "torch-c-dlpack-ext"
+version = "0.1.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/37/de/921b6491efce5c389a5ef9bbed3d2d6660005840dae488124173180859ab/torch_c_dlpack_ext-0.1.5.tar.gz", hash = "sha256:d06f0357d575d22a168cc77acb9020fc4bae30968ceb6718a055dcbe92bacabe", size = 12913, upload-time = "2026-01-12T11:25:08.484Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b1/67/10d236698525d7b7db4d74ec0a4b01f5b2db33968995fdd9ac6b4635e327/torch_c_dlpack_ext-0.1.5-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:c0f2bd51fcd99c0e5b50314e1985f2728c4941bfa821f065e6c30951d1f995ca", size = 5291237, upload-time = "2026-01-12T11:24:44.011Z" },
+    { url = "https://files.pythonhosted.org/packages/87/06/8d760997307a5c3be4384424667bf31aae0a42060838c532c7d846516175/torch_c_dlpack_ext-0.1.5-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:3562ee411258676f9c38b8ad39306d1c8d027b6a86f6a87c920d2d009a9d1510", size = 443069, upload-time = "2026-01-12T11:24:45.451Z" },
+    { url = "https://files.pythonhosted.org/packages/e2/79/a914539b4785f3e44f891aa012a886edb8bc10fe081c440981c57543ce21/torch_c_dlpack_ext-0.1.5-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e6f9da4bb9af70e27facc777458be62e10dbbbddda7672d16138db0553c5a524", size = 897846, upload-time = "2026-01-12T11:24:48.168Z" },
+    { url = "https://files.pythonhosted.org/packages/3a/e6/7d7a97a3953208d6d6ce749180c34d1dab48464ded9a76cecabe9d021ce6/torch_c_dlpack_ext-0.1.5-cp312-cp312-win_amd64.whl", hash = "sha256:670fbbab70123cc228bed41693a3720757af57a0ad22669063c9db25321e8f55", size = 1482855, upload-time = "2026-01-12T11:24:49.581Z" },
+    { url = "https://files.pythonhosted.org/packages/ca/c6/65346a201d921b616731311fc9941f15137672b444cebdad702cb52ccee0/torch_c_dlpack_ext-0.1.5-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:74acea2ed395cadda63342845b9e9ee7cd4537846223dacfb4431b4610109265", size = 1993243, upload-time = "2026-01-12T11:24:51.079Z" },
+    { url = "https://files.pythonhosted.org/packages/fd/ec/faf10be09a5812b1c5ec9922b53fb5def5fc4080b81a653b9347bb169ebb/torch_c_dlpack_ext-0.1.5-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:49f1e99d13c64e22dac0a34a1560e9e5a398a49a9fa81df83053e04fde6ec5bd", size = 443798, upload-time = "2026-01-12T11:24:52.754Z" },
+    { url = "https://files.pythonhosted.org/packages/2d/68/f434b48700f3e04f33882f54d8d3910327b935f55e14ec49da7d607bf470/torch_c_dlpack_ext-0.1.5-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:debe62e5ef93e631065d6b9f6e60d3d39bae6b89fa1b25d9523f40b3efbf8aba", size = 755004, upload-time = "2026-01-12T11:24:54.004Z" },
+    { url = "https://files.pythonhosted.org/packages/03/a8/cc64e563f05ea99bd79bdb43f71f0f46452d3acd734da4843ede5fc73a35/torch_c_dlpack_ext-0.1.5-cp313-cp313-win_amd64.whl", hash = "sha256:30e3eab616dbc81dfdb7492aca557be551a9163ba9b585f97394a42b336b113a", size = 999126, upload-time = "2026-01-12T11:24:55.44Z" },
+    { url = "https://files.pythonhosted.org/packages/96/5e/449324ca8e81573e650b6851fc31c1038f750d1de85d0b185d788e1c7a3a/torch_c_dlpack_ext-0.1.5-cp314-cp314-macosx_14_0_arm64.whl", hash = "sha256:cac94a4905d391889e679a8da31e46dc325af5d55d13b7c70c0ce3d71d1ced6d", size = 1982154, upload-time = "2026-01-12T11:24:58.038Z" },
+    { url = "https://files.pythonhosted.org/packages/20/62/11c05b99f69aa5152bca0313e0dfa6d125a020cf890dc888ef009aa7891c/torch_c_dlpack_ext-0.1.5-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:3a58fdf45fb0bda7bc459632cec891570f31c11636d5851c825cf308ec8b73c2", size = 163825, upload-time = "2026-01-12T11:24:59.474Z" },
+    { url = "https://files.pythonhosted.org/packages/15/b5/be613cd8e71c9982bd07af530f86c5a7f30df7831d14cec5414857af7149/torch_c_dlpack_ext-0.1.5-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7b985a324c68241cf83a9474b28015524b66775b12a91930dd4c0760aa628d01", size = 171740, upload-time = "2026-01-12T11:25:00.776Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/11/52e291f1659e2ec70a09f5ca4ad27e015eb4f0a1371ae68d23a9fbd1c704/torch_c_dlpack_ext-0.1.5-cp314-cp314-win_amd64.whl", hash = "sha256:d794e19fa3f330ab7a29987c07e031fc08e4953aec516d35701d0827863e356b", size = 277086, upload-time = "2026-01-12T11:25:01.901Z" },
 ]
 
 [[package]]

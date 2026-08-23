@@ -1,13 +1,13 @@
 """Attention in plain XLA ops, for when the flash kernel is unavailable.
 
-`flash_mha_varlen` is a CUDA custom call, so the model cannot run at all on a
+The fa4-jax kernels are CUDA-only, so the model cannot run at all on a
 host-only backend. That matters for exactly one thing: a bf16 reference of a
 model too large to fit in VRAM has to run somewhere, and the honest place is
 the same model code the quantized runs use, on CPU. A separate reference
 implementation (HF, say) would fold implementation differences into every
 measured quantization gap.
 
-These are the same maths as the varlen calls they stand in for, written as a
+These are the same maths as the flash calls they stand in for, written as a
 dense masked softmax: O(seq^2) where flash is O(seq), which is why they are the
 fallback and not the default.
 
@@ -72,10 +72,8 @@ def causal_mask(
     """Causal mask for `seq_len` queries starting at absolute position `query_offset`.
 
     A query attends a key when the key is unpadded and does not come after it.
-    The flash path expresses the same thing by compacting the valid tokens to
-    the front and running two varlen segments over them; because that
-    compaction is a stable sort it preserves relative order, so causality among
-    the valid tokens is the same relation either way.
+    The flash path expresses the same relation as a mask mod
+    (`attention.PaddedCausalMask`) evaluated inside the kernel.
     """
     kv_pos = jnp.arange(kv_mask.shape[0])
     q_pos = query_offset + jnp.arange(seq_len)
@@ -87,8 +85,8 @@ def segment_mask(
 ) -> Bool[Array, "seq seq"]:
     """Block-diagonal mask: tokens attend within their own packed sequence.
 
-    `cu_seqlens` is the same cumulative-length vector the varlen kernel takes,
-    so the segment a token belongs to is how many boundaries precede it.
+    `cu_seqlens` is the cumulative-length vector the vision tower produces; the
+    segment a token belongs to is how many boundaries precede it.
     """
     pos = jnp.arange(seq_len)
     segment = jnp.searchsorted(cu_seqlens, pos, side="right") - 1
