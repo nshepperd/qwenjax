@@ -247,3 +247,22 @@ def test_distillation_step(model, tokenizer, tokens):
     np.testing.assert_array_equal(np.asarray(c.keys[:, 0]), np.asarray(cart.keys[:, 0]))
     np.testing.assert_array_equal(np.asarray(c.values[:, 0]), np.asarray(cart.values[:, 0]))
     assert not np.array_equal(np.asarray(c.keys[:, 1]), np.asarray(cart.keys[:, 1]))
+
+
+def test_probe_matches_prefix_path(model, tokens, prefix):
+    """The dense-attention probe is the model: same logits, weights sum to one."""
+    from qwen_jax.probe import probe
+
+    b = np.asarray(tokens.suffix, np.int32)
+    p = prefix.length
+    segments = np.concatenate([np.zeros(p // 2, np.int32), np.ones(p - p // 2, np.int32),
+                               np.full(len(b), 2, np.int32)])
+    res = probe(model, jnp.asarray(b), prefix, jnp.asarray(segments), num_segments=3)
+    ref = model(input_ids=_ids(b), prefix=prefix)
+    assert_same_dist(ref.logits[0], res.logits)
+    seg = np.asarray(res.by_segment)
+    assert seg.shape == (prefix.num_layers, model.config.text_config.num_attention_heads, len(b), 3)
+    np.testing.assert_allclose(seg.sum(-1), 1.0, atol=2e-3)
+    slot = np.asarray(res.by_slot)
+    assert slot.shape == (prefix.num_layers, p + len(b))
+    np.testing.assert_allclose(slot.sum(-1), 1.0, atol=2e-3)

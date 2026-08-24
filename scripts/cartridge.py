@@ -55,14 +55,14 @@ def load_tokenizer():
     return AutoTokenizer.from_pretrained(HF)
 
 
-def load_corpus(tokenizer, files: list[str] | None):
+def load_corpus(tokenizer, files: list[str] | None, root: str | None = None):
     from qwen_jax.selfstudy import Corpus
 
     if files:
-        paths = [Path(f) for f in files]
+        paths = [Path(f).resolve() for f in files]
     else:
         paths = sorted((REPO / "src" / "qwen_jax").rglob("*.py"))
-    corpus = Corpus.from_files(tokenizer, paths, root=REPO)
+    corpus = Corpus.from_files(tokenizer, paths, root=Path(root).resolve() if root else REPO)
     print(f"corpus: {len(paths)} files, {len(corpus)} tokens", flush=True)
     return corpus
 
@@ -71,7 +71,7 @@ def cmd_gen(args):
     from qwen_jax.selfstudy import save_examples, self_study
 
     tokenizer = load_tokenizer()
-    corpus = load_corpus(tokenizer, args.files)
+    corpus = load_corpus(tokenizer, args.files, args.root)
     model = load_model()
     t = time.time()
 
@@ -79,7 +79,7 @@ def cmd_gen(args):
         print(f"  {done}/{total} conversations  ({time.time() - t:.0f}s)", flush=True)
 
     examples = self_study(
-        model, tokenizer, corpus, n=args.n, description=DESCRIPTION,
+        model, tokenizer, corpus, n=args.n, description=args.description,
         key=jax.random.key(args.seed), seed=args.seed, batch_size=args.batch,
         chunk_tokens=(args.chunk_min, args.chunk_max),
         max_user_tokens=args.max_user, max_assistant_tokens=args.max_assistant,
@@ -102,15 +102,18 @@ def init_cartridge(model, tokenizer, corpus, p: int, description: str):
     return Cartridge.init_from_tokens(model, ids, meta=meta)
 
 
-def batches_from(tokenizer, examples, args, *, shuffle: bool, seed: int = 0):
+def batches_from(tokenizer, examples, args, *, shuffle: bool, seed: int = 0,
+                 description: str | None = None):
     from qwen_jax.distill import make_batch
 
+    if description is None:
+        description = args.description
     idx = list(range(len(examples)))
     if shuffle:
         random.Random(seed).shuffle(idx)
     for i in range(0, len(idx) - args.batch + 1, args.batch):
         group = [examples[j] for j in idx[i:i + args.batch]]
-        yield make_batch(tokenizer, group, description=DESCRIPTION, context=args.context,
+        yield make_batch(tokenizer, group, description=description, context=args.context,
                          seq=args.seq, pad_id=tokenizer.pad_token_id)
 
 
@@ -138,7 +141,7 @@ def cmd_train(args):
     from qwen_jax.selfstudy import load_examples
 
     tokenizer = load_tokenizer()
-    corpus = load_corpus(tokenizer, args.files)
+    corpus = load_corpus(tokenizer, args.files, args.root)
     train = load_examples(args.data)
     heldout = load_examples(args.heldout) if args.heldout else []
     print(f"{len(train)} train, {len(heldout)} held-out examples")
@@ -147,7 +150,7 @@ def cmd_train(args):
     if args.resume:
         cart = Cartridge.load(args.resume)
     else:
-        cart = init_cartridge(model, tokenizer, corpus, args.p, DESCRIPTION)
+        cart = init_cartridge(model, tokenizer, corpus, args.p, args.description)
     print(f"cartridge: p={cart.length}, {cart.num_layers} layers, "
           f"{cart.keys.size * 2 * 4 / 1e6:.0f} MB of float32 parameters")
 
@@ -197,12 +200,12 @@ def cmd_eval(args):
     from qwen_jax.selfstudy import load_examples
 
     tokenizer = load_tokenizer()
-    corpus = load_corpus(tokenizer, args.files)
+    corpus = load_corpus(tokenizer, args.files, args.root)
     heldout = load_examples(args.heldout)
     model = load_model()
-    held = list(batches_from(tokenizer, heldout, args, shuffle=False))
-
     trained = Cartridge.load(args.cartridge)
+    held = list(batches_from(tokenizer, heldout, args, shuffle=False,
+                             description=trained.meta.description))
     rows = {
         "trained cartridge": trained,
         "init cartridge (ICL on first p tokens)": init_cartridge(
@@ -221,7 +224,7 @@ def cmd_ask(args):
     from qwen_jax.selfstudy import generate_batch
 
     tokenizer = load_tokenizer()
-    corpus = load_corpus(tokenizer, args.files)
+    corpus = load_corpus(tokenizer, args.files, args.root)
     model = load_model()
     trained = Cartridge.load(args.cartridge)
     variants = {"trained": trained}
@@ -255,6 +258,9 @@ def main():
 
     def common(s):
         s.add_argument("--files", nargs="*", help="corpus files (default: src/qwen_jax/**/*.py)")
+        s.add_argument("--root", help="directory the corpus file headers are relative to")
+        s.add_argument("--description", default=DESCRIPTION,
+                       help="text prepended to each chunk in the system prompt")
 
     def shapes(s):
         s.add_argument("--batch", type=int, default=2)
