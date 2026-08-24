@@ -132,6 +132,80 @@ class Qwen3VLVisionAttention(eqx.Module):
         return self.proj(attn_output)
 
 
+def masked_causal_attention(
+    q: Float[Array, "batch seq heads head_dim"],
+    k: Float[Array, "batch kv_seq kv_heads head_dim"],
+    v: Float[Array, "batch kv_seq kv_heads head_dim"],
+    *,
+    cache_position: Int[Array, ""] | None,
+    kv_mask: Bool[Array, "batch kv_seq"] | None,
+) -> Float[Array, "batch seq heads head_dim"]:
+    """Causal attention over a (possibly cached, possibly padded) key sequence.
+
+    The routing lives here so every attention module shares it: the flash
+    kernel where enabled, the XLA reference path otherwise. `cache_position`
+    being set means q sits at that offset within a longer k/v (decode or
+    chunked prefill against a cache); None means q and k share positions.
+
+    Returns the attention output in (batch, seq, heads, head_dim), in the
+    dtype of q.
+    """
+    batch_size, seq_len = q.shape[:2]
+    # The fa4 kernels tile shared memory by head_dim and 256-dim heads
+    # (Qwen3.5) exceed the sm_120 budget; route those to the XLA path.
+    use_flash = axla.use_flash() and q.shape[-1] <= 128
+    dtype = q.dtype
+    if dtype == jnp.float32 and use_flash:
+        # The flash kernel only takes 16-bit inputs; the XLA path does not
+        # need the downcast and a float32 reference should not pay it.
+        q = q.astype(jnp.float16)
+        k = k.astype(jnp.float16)
+        v = v.astype(jnp.float16)
+
+    if not use_flash:
+        if kv_mask is None:
+            raise NotImplementedError(
+                "Causal attention without mask is not implemented."
+            )
+        if cache_position is None:
+            mask = jax.vmap(axla.causal_mask, in_axes=(0, None))(kv_mask, seq_len)
+        else:
+            mask = jax.vmap(axla.causal_mask, in_axes=(0, None, None))(
+                kv_mask, seq_len, cache_position
+            )
+        attn_output = jax.vmap(axla.masked_attention)(q, k, v, mask)
+    elif kv_mask is not None and cache_position is None:
+        # Prefill without a cache: queries and keys share positions, so
+        # the kernel's native causal path (which skips future KV blocks)
+        # does the causality and the mask mod only drops padded keys.
+        assert kv_mask.shape == (batch_size, seq_len)
+        mask = PaddedCausalMask(
+            key_valid=kv_mask.astype(jnp.int32),
+            offset=jnp.zeros((batch_size,), jnp.int32),
+        )
+        attn_output = flash_attn(
+            q, k, v, causal=True, mask_mod=mask, backend="cute"
+        )
+    elif kv_mask is not None and cache_position is not None:
+        # Queries sit at cache_position.. within the cache, which is not
+        # the bottom-right alignment the native causal path assumes, so
+        # the mask mod carries the offset instead. Padded and not-yet-
+        # written cache slots are both dropped by the mask: the former by
+        # kv_mask, the latter by causality.
+        assert kv_mask.shape == (batch_size, k.shape[1])
+        mask = PaddedCausalMask(
+            key_valid=kv_mask.astype(jnp.int32),
+            offset=jnp.full((batch_size,), cache_position, jnp.int32),
+        )
+        attn_output = flash_attn(q, k, v, mask_mod=mask, backend="cute")
+    else:
+        raise NotImplementedError(
+            "Causal attention without mask is not implemented."
+        )
+
+    return attn_output.astype(dtype)
+
+
 class Qwen3VLTextAttention(eqx.Module):
     """Text attention with QK normalization and MRoPE.
 
@@ -236,64 +310,16 @@ class Qwen3VLTextAttention(eqx.Module):
             new_cache = cache.update(cache_position, k, v)
             # Get full K, V from cache
             k, v = new_cache.get()
-
-        # Compute attention
-        # jax.nn.dot_product_attention expects (batch, seq, heads, head_dim) - NTHD order
-        dtype = q.dtype
-        if dtype == jnp.float32 and axla.use_flash():
-            # The flash kernel only takes 16-bit inputs; the XLA path does not
-            # need the downcast and a float32 reference should not pay it.
-            q = q.astype(jnp.float16)
-            k = k.astype(jnp.float16)
-            v = v.astype(jnp.float16)
-
-        # Use JAX's dot product attention
-        if not axla.use_flash():
-            if kv_mask is None:
-                raise NotImplementedError(
-                    "Causal attention without mask is not implemented."
-                )
-            if cache is None:
-                mask = jax.vmap(axla.causal_mask, in_axes=(0, None))(kv_mask, seq_len)
-            else:
-                assert cache_position is not None
-                mask = jax.vmap(axla.causal_mask, in_axes=(0, None, None))(
-                    kv_mask, seq_len, cache_position
-                )
-            attn_output = jax.vmap(axla.masked_attention)(q, k, v, mask)
-        elif kv_mask is not None and cache is None:
-            # Prefill without a cache: queries and keys share positions, so
-            # the kernel's native causal path (which skips future KV blocks)
-            # does the causality and the mask mod only drops padded keys.
-            assert kv_mask.shape == (batch_size, seq_len)
-            mask = PaddedCausalMask(
-                key_valid=kv_mask.astype(jnp.int32),
-                offset=jnp.zeros((batch_size,), jnp.int32),
-            )
-            attn_output = flash_attn(
-                q, k, v, causal=True, mask_mod=mask, backend="cute"
-            )
-        elif kv_mask is not None and cache is not None:
-            # Queries sit at cache_position.. within the cache, which is not
-            # the bottom-right alignment the native causal path assumes, so
-            # the mask mod carries the offset instead. Padded and not-yet-
-            # written cache slots are both dropped by the mask: the former by
-            # kv_mask, the latter by causality.
             assert cache_position is not None
-            assert kv_mask.shape == (batch_size, cache.keys.shape[1])
-            mask = PaddedCausalMask(
-                key_valid=kv_mask.astype(jnp.int32),
-                offset=jnp.full((batch_size,), cache_position, jnp.int32),
-            )
-            attn_output = flash_attn(q, k, v, mask_mod=mask, backend="cute")
         else:
-            raise NotImplementedError(
-                "Causal attention without mask is not implemented."
-            )
+            cache_position = None
+
+        attn_output = masked_causal_attention(
+            q, k, v, cache_position=cache_position, kv_mask=kv_mask
+        )
 
         # Reshape to (batch, seq, hidden) - already in (batch, seq, heads, dim)
         attn_output = attn_output.reshape(batch_size, seq_len, -1)
-        attn_output = attn_output.astype(dtype)
 
         # Output projection
         output = self.o_proj(attn_output)
@@ -301,4 +327,4 @@ class Qwen3VLTextAttention(eqx.Module):
         return output, new_cache
 
 
-__all__ = ["Qwen3VLTextAttention", "Qwen3VLVisionAttention"]
+__all__ = ["Qwen3VLTextAttention", "Qwen3VLVisionAttention", "masked_causal_attention"]

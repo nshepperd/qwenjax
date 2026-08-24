@@ -44,6 +44,9 @@ class RopeScalingConfig(BaseModel):
     high_freq_factor: float | None = None
     mrope_section: tuple[int, int, int] | None = None
     mrope_interleaved: bool = True
+    # Fraction of head_dim that rotates; the rest passes through unrotated.
+    # Qwen3.5 uses 0.25 (64 of 256 dims). None means all of it, as in Qwen3-VL.
+    partial_rotary_factor: float | None = None
 
 class Qwen3VLTextConfig(BaseModel):
     """Configuration for the Qwen3-VL text decoder."""

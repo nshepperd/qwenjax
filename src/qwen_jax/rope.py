@@ -105,9 +105,11 @@ class Qwen3VLTextRotaryEmbedding(eqx.Module):
         self.head_dim = config.head_dim
         self.mrope_section = config.rope_scaling.mrope_section or (24, 20, 20)
         self.attention_scaling = 1.0
-        # Standard RoPE inv_freq
+        # Standard RoPE inv_freq. With a partial rotary factor (Qwen3.5) only
+        # the first `dim` dims of each head rotate; cos/sin come out sized to
+        # `dim` and apply_rotary_pos_emb passes the rest of the head through.
         rope_theta = config.rope_theta
-        dim = config.head_dim
+        dim = int(config.head_dim * (config.rope_scaling.partial_rotary_factor or 1.0))
         self.inv_freq = 1.0 / (rope_theta ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
 
     def apply_interleaved_mrope(
@@ -189,21 +191,31 @@ def apply_rotary_pos_emb(
 ) -> tuple[Float[Array, "batch seq heads head_dim"], Float[Array, "batch seq kv_heads head_dim"]]:
     """Apply rotary position embedding to query and key tensors.
 
+    When cos/sin cover fewer dims than the head (partial rotary, Qwen3.5),
+    only the leading dims rotate and the tail passes through unchanged.
+
     Args:
         q: Query tensor (batch, seq, heads, head_dim)
         k: Key tensor (batch, seq, kv_heads, head_dim)
-        cos: Cosine embeddings (batch, seq, head_dim)
-        sin: Sine embeddings (batch, seq, head_dim)
+        cos: Cosine embeddings (batch, seq, rotary_dim)
+        sin: Sine embeddings (batch, seq, rotary_dim)
 
     Returns:
         Tuple of (q_embed, k_embed) with RoPE applied
     """
-    # Add heads dimension: (batch, seq, head_dim) -> (batch, seq, 1, head_dim)
+    # Add heads dimension: (batch, seq, rotary_dim) -> (batch, seq, 1, rotary_dim)
     cos = cos[:, :, None, :]
     sin = sin[:, :, None, :]
 
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    rotary_dim = cos.shape[-1]
+    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+
+    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+
+    q_embed = jnp.concatenate([q_embed, q_pass], axis=-1)
+    k_embed = jnp.concatenate([k_embed, k_pass], axis=-1)
 
     return q_embed, k_embed
 
