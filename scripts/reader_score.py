@@ -394,14 +394,15 @@ def cmd_respond(args):
             texts = generate(model, tokenizer, prompts, prefix=prefixes[cond],
                              max_new=args.max_new, temperature=args.temperature, key=sub,
                              batch=args.batch)
+            name = args.label if args.label and cond == "trained" else cond
             for r, text in zip(qa, texts):
                 rows.append({**{k: v for k, v in r.items() if k != "chunk_ids"},
-                             "condition": cond, "sample": s, "response": text})
+                             "condition": name, "sample": s, "response": text})
             print(f"  {cond} sample {s}: {len(texts)} responses ({time.time() - t0:.0f}s)",
                   flush=True)
 
     write_jsonl(rows, args.out)
-    for cond in args.conditions:
+    for cond in dict.fromkeys(x["condition"] for x in rows):
         r = next(x for x in rows if x["condition"] == cond)
         print(f"\n=== {cond} [{r['kind']}] {r['question']}\n{r['response'][:400]}")
 
@@ -540,7 +541,9 @@ COLS = [("N", "n"), ("logscore", "logscore"), ("P(gold)", "p_gold"), ("acc-in", 
 
 def cmd_score(args):
     rows = read_jsonl(args.read)
-    conds = [c for c in CONDITIONS if any(r["condition"] == c for r in rows)]
+    seen = list(dict.fromkeys(r["condition"] for r in rows))
+    conds = ([c for c in CONDITIONS if c in seen]
+             + [c for c in seen if c not in CONDITIONS])
     scores = {c: summarise([r for r in rows if r["condition"] == c], args.clip) for c in conds}
 
     print(f"\nreader-mediated scores, {len(rows)} responses, "
@@ -644,6 +647,8 @@ def main():
     r.add_argument("--cartridge", default=str(TRAINED))
     r.add_argument("--wrong", default=str(WRONG))
     r.add_argument("--samples", type=int, default=1)
+    r.add_argument("--label", help="rename the `trained` condition in the output, "
+                                  "so several cartridges can be compared")
     r.add_argument("--limit", type=int, help="only the first N questions")
     r.add_argument("--batch", type=int, default=4)
     r.add_argument("--max-new", type=int, default=256)
