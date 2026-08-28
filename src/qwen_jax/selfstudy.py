@@ -149,6 +149,14 @@ class Example:
     user: str
     assistant: str
     seed_kind: str = ""
+    teacher_note: str = ""
+    """Instruction added to the *teacher's* system prompt only, never the student's.
+
+    Context distillation (arXiv 2209.15189): a behaviour the teacher only shows
+    when told to is distilled into the cartridge, which then shows it with
+    nothing in its context. Empty means the teacher sees exactly the chunk, as
+    before.
+    """
 
     def to_json(self) -> str:
         return json.dumps(dataclasses.asdict(self))

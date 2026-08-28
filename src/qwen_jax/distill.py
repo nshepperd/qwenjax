@@ -66,6 +66,11 @@ class Batch:
 def encode_example(tokenizer, ex: Example, description: str) -> chat.Tokens:
     chunk_text = tokenizer.decode(ex.chunk_ids, skip_special_tokens=False)
     system = f"{description}\n\n{chunk_text}" if description else chunk_text
+    # `teacher_note` lands in the system text, which only the teacher reads --
+    # the student's view is the suffix alone. So an instruction here is
+    # distilled into the cartridge rather than required at inference.
+    if ex.teacher_note:
+        system = f"{system}\n\n{ex.teacher_note}"
     return chat.encode(tokenizer, system, [("user", ex.user), ("assistant", ex.assistant)])
 
 
