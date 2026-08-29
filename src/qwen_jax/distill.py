@@ -57,6 +57,13 @@ class Batch:
     student_ids: Int[Array, "batch seq"]
     student_mask: Int[Array, "batch seq"]
     loss_mask: Bool[Array, "batch seq"]
+    # A student-only preamble, sitting between the cartridge and the
+    # conversation. Kept in its own array rather than prepended to
+    # `student_ids` so that `context`, `loss_mask` and the KL alignment all
+    # stay exactly as they were; `distill_loss` joins it on and slices it back
+    # off. `None` is the original behaviour, to the token.
+    note_ids: Int[Array, "batch note"] | None = None
+    note_mask: Int[Array, "batch note"] | None = None
 
     @property
     def context(self) -> int:
@@ -95,6 +102,8 @@ def make_batch(
     t_mask = np.zeros((b, context + seq), dtype=np.int32)
     s_ids = np.full((b, seq), pad_id, dtype=np.int32)
     s_mask = np.zeros((b, seq), dtype=np.int32)
+    enc = lambda s: tokenizer.encode(s, add_special_tokens=False)
+    notes = [enc(ex.student_note) if getattr(ex, "student_note", "") else [] for ex in examples]
     for i, ex in enumerate(examples):
         toks = encode_example(tokenizer, ex, description)
         system = toks.system[-context:]
@@ -105,12 +114,27 @@ def make_batch(
         t_mask[i, context:context + len(suffix)] = 1
         s_ids[i, :len(suffix)] = suffix
         s_mask[i, :len(suffix)] = 1
+    n_ids = n_mask = None
+    if any(notes):
+        # Right-padded to the longest note in the batch. The padding is masked
+        # out, and positions come from the mask, so a shorter note simply
+        # starts the conversation earlier -- no row is misaligned by sharing
+        # the block with a longer one.
+        width = max(len(n) for n in notes)
+        ni = np.full((b, width), pad_id, dtype=np.int32)
+        nm = np.zeros((b, width), dtype=np.int32)
+        for i, n in enumerate(notes):
+            ni[i, :len(n)] = n
+            nm[i, :len(n)] = 1
+        n_ids, n_mask = jnp.asarray(ni), jnp.asarray(nm)
     return Batch(
         teacher_ids=jnp.asarray(t_ids),
         teacher_mask=jnp.asarray(t_mask),
         student_ids=jnp.asarray(s_ids),
         student_mask=jnp.asarray(s_mask),
         loss_mask=jnp.asarray(s_mask.astype(bool)),
+        note_ids=n_ids,
+        note_mask=n_mask,
     )
 
 
@@ -155,11 +179,19 @@ def distill_loss(model, cartridge: Cartridge, batch: Batch, *, block: int = 128)
         input_ids=batch.teacher_ids, attention_mask=batch.teacher_mask,
     )
     teacher_hidden = jax.lax.stop_gradient(teacher_hidden[:, context:])
+    s_ids, s_mask, n = batch.student_ids, batch.student_mask, 0
+    if batch.note_ids is not None:
+        # The note is real context for the student: it occupies positions, so
+        # the conversation is rotated further along than the teacher's copy of
+        # it. That asymmetry is the point -- the cartridge has to absorb it.
+        n = batch.note_ids.shape[1]
+        s_ids = jnp.concatenate([batch.note_ids, s_ids], axis=1)
+        s_mask = jnp.concatenate([batch.note_mask, s_mask], axis=1)
     student_hidden, _, _ = model.model(
-        input_ids=batch.student_ids, attention_mask=batch.student_mask,
+        input_ids=s_ids, attention_mask=s_mask,
         prefix=cartridge.prefix(model.cache_dtype()),
     )
-    return blockwise_kl(model.get_lm_head(), student_hidden, teacher_hidden,
+    return blockwise_kl(model.get_lm_head(), student_hidden[:, n:], teacher_hidden,
                         batch.loss_mask, block=block)
 
 

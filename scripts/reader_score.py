@@ -389,7 +389,14 @@ def cmd_respond(args):
                     for r in qa
                 ]
             else:
-                prompts = [encode_suffix(tokenizer, QUERY.format(q=r["question"])) for r in qa]
+                # `--note` reproduces at inference what a `student_note` example
+                # looked like in training: cartridge, then note, then the
+                # conversation. Used to test whether a note re-cancels a
+                # direction the cartridge anti-distilled away.
+                note = (tokenizer.encode(args.note, add_special_tokens=False)
+                        if getattr(args, "note", None) else [])
+                prompts = [note + encode_suffix(tokenizer, QUERY.format(q=r["question"]))
+                           for r in qa]
             key, sub = jax.random.split(key)
             texts = generate(model, tokenizer, prompts, prefix=prefixes[cond],
                              max_new=args.max_new, temperature=args.temperature, key=sub,
@@ -647,6 +654,8 @@ def main():
     r.add_argument("--cartridge", default=str(TRAINED))
     r.add_argument("--wrong", default=str(WRONG))
     r.add_argument("--samples", type=int, default=1)
+    r.add_argument("--note", help="text placed between the cartridge and the "
+                                  "conversation, as `student_note` does in training")
     r.add_argument("--label", help="rename the `trained` condition in the output, "
                                   "so several cartridges can be compared")
     r.add_argument("--limit", type=int, help="only the first N questions")

@@ -157,6 +157,16 @@ class Example:
     nothing in its context. Empty means the teacher sees exactly the chunk, as
     before.
     """
+    student_note: str = ""
+    """Instruction placed in the *student's* context only, never the teacher's.
+
+    The mirror image of `teacher_note`, and it runs the algebra backwards. The
+    student is trained to match a teacher that never saw this instruction, so
+    whatever the instruction does to the student's behaviour the cartridge must
+    cancel to close the KL. At consumption the note is gone and only the
+    cancellation remains -- the behaviour is *subtracted* rather than added.
+    Empty means the student sees exactly the conversation, as before.
+    """
 
     def to_json(self) -> str:
         return json.dumps(dataclasses.asdict(self))
