@@ -211,8 +211,36 @@ def test_save_load_roundtrip(model, tokens, tmp_path):
     back = Cartridge.load(tmp_path / "c.safetensors")
     np.testing.assert_array_equal(np.asarray(back.keys), np.asarray(cart.keys))
     np.testing.assert_array_equal(np.asarray(back.values), np.asarray(cart.values))
+    np.testing.assert_array_equal(np.asarray(back.key_scale), np.asarray(cart.key_scale))
+    np.testing.assert_array_equal(np.asarray(back.value_scale), np.asarray(cart.value_scale))
     np.testing.assert_array_equal(np.asarray(back.trainable), np.asarray(cart.trainable))
     assert back.meta == cart.meta and int(back.steps) == 3
+
+
+def test_unit_rms_parameterization(model, tokens, prefix, tmp_path):
+    """The optimiser's view is unit-RMS per layer; the model's view is the
+    original KV to float32 rounding; a legacy file (physical KV, no scales)
+    loads to the same thing."""
+    import safetensors.flax as st
+
+    cart = Cartridge.from_prefix(prefix)
+    raw = Cartridge.from_prefix(prefix, unit_rms=False)
+    K, V = np.asarray(prefix.keys, np.float32), np.asarray(prefix.values, np.float32)
+    rms = lambda x: np.sqrt(np.mean(x * x, axis=(1, 2, 3)))
+    np.testing.assert_allclose(rms(np.asarray(cart.keys)), 1.0, rtol=1e-5)
+    np.testing.assert_allclose(rms(np.asarray(cart.values)), 1.0, rtol=1e-5)
+    np.testing.assert_allclose(np.asarray(cart.key_scale)[:, 0, 0, 0], rms(K), rtol=1e-5)
+    assert rms(K).max() / rms(K).min() > 2, "the spread this exists for"
+    np.testing.assert_array_equal(np.asarray(raw.keys), K)
+    np.testing.assert_array_equal(np.asarray(raw.key_scale), 1.0)
+    np.testing.assert_allclose(np.asarray(cart.physical_keys), K, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(cart.physical_values), V, rtol=1e-6, atol=1e-6)
+
+    st.save_file({"keys": raw.keys, "values": raw.values, "trainable": raw.trainable,
+                  "steps": raw.steps}, str(tmp_path / "legacy.safetensors"))
+    legacy = Cartridge.load(tmp_path / "legacy.safetensors")
+    np.testing.assert_array_equal(np.asarray(legacy.key_scale), np.asarray(cart.key_scale))
+    np.testing.assert_array_equal(np.asarray(legacy.keys), np.asarray(cart.keys))
 
 
 def test_distillation_step(model, tokenizer, tokens):

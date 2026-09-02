@@ -282,10 +282,10 @@ def main():
         holder["tnorm"] = float(jnp.sum(t * t))
         loss_fn = jax.jit(functools.partial(loss_raw, tgt=tgt))
 
-        K0 = jnp.asarray(init.keys[li], jnp.float32)
-        V0 = jnp.asarray(init.values[li], jnp.float32)
-        Kt = jnp.asarray(trained.keys[li], jnp.float32)
-        Vt = jnp.asarray(trained.values[li], jnp.float32)
+        K0 = jnp.asarray(init.physical_keys[li], jnp.float32)
+        V0 = jnp.asarray(init.physical_values[li], jnp.float32)
+        Kt = jnp.asarray(trained.physical_keys[li], jnp.float32)
+        Vt = jnp.asarray(trained.physical_values[li], jnp.float32)
 
         r = {"init_loss": float(loss_fn({"K": K0, "V": V0})),
              "sgd300_loss": float(loss_fn({"K": Kt, "V": Vt}))}

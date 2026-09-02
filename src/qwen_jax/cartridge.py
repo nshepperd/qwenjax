@@ -15,6 +15,19 @@ to the cache dtype on the way into attention.
 The first slot is frozen. It holds the KV of the first token of the sequence,
 which functions as the attention sink; letting it train destabilises the run
 (the paper's Appendix A reports accuracy collapsing when it is trainable).
+
+Parameterization. The KV cache's scale is wildly nonuniform across layers
+(per-layer key RMS spreads 8x over the stack, value RMS 238x, on Qwen3-VL-8B),
+and Adam's per-coordinate step is scale-free only up to the *learning rate*,
+which is one number for the whole cartridge. So the parameters are stored at
+unit RMS per layer: `keys`/`values` are what the optimiser sees, and the
+per-layer `key_scale`/`value_scale`, fixed at initialisation, are multiplied
+back in by `prefix()`. At equal budget this trained a markedly better
+cartridge than raw KV parameters (held-out KL 0.561 vs 0.624 under the
+attention-MSE objective, 2000 steps), so it is the default; `unit_rms=False`
+at construction keeps the scales at one, which is the raw parameterization.
+`physical_keys`/`physical_values` are the KV the model attends to, for code
+that inspects a cartridge rather than trains it.
 """
 from __future__ import annotations
 
@@ -58,7 +71,11 @@ class Cartridge(eqx.Module):
     """Trainable KV prefix. See the module docstring."""
 
     keys: Float[Array, "layers p kv_heads head_dim"]
+    """The optimiser's view of the keys: `physical_keys / key_scale`."""
     values: Float[Array, "layers p kv_heads head_dim"]
+    key_scale: Float[Array, "layers 1 1 1"]
+    """Per-layer scale fixed at construction (the init KV's RMS, or ones)."""
+    value_scale: Float[Array, "layers 1 1 1"]
     trainable: Bool[Array, "p"]
     meta: CartridgeMeta = eqx.field(static=True)
     # An array, not a static int: a static field is part of jit's cache key,
@@ -73,11 +90,50 @@ class Cartridge(eqx.Module):
     def num_layers(self) -> int:
         return self.keys.shape[0]
 
+    @property
+    def physical_keys(self) -> Float[Array, "layers p kv_heads head_dim"]:
+        """The keys the model attends to, in float32."""
+        return self.keys * self.key_scale
+
+    @property
+    def physical_values(self) -> Float[Array, "layers p kv_heads head_dim"]:
+        return self.values * self.value_scale
+
     def prefix(self, dtype=jnp.bfloat16) -> KVPrefix:
         """The prefix the model attends to, in the cache dtype."""
-        return KVPrefix(keys=self.keys.astype(dtype), values=self.values.astype(dtype))
+        return KVPrefix(keys=self.physical_keys.astype(dtype),
+                        values=self.physical_values.astype(dtype))
 
     # --- construction ------------------------------------------------------
+
+    @classmethod
+    def from_physical(
+        cls,
+        keys: Array,
+        values: Array,
+        *,
+        trainable: Array,
+        meta: CartridgeMeta,
+        steps: Array | int = 0,
+        unit_rms: bool = True,
+    ) -> Cartridge:
+        """Build from the KV the model attends to, choosing the parameterization."""
+        keys = jnp.asarray(keys, dtype=jnp.float32)
+        values = jnp.asarray(values, dtype=jnp.float32)
+        if unit_rms:
+            key_scale, value_scale = _layer_rms(keys), _layer_rms(values)
+        else:
+            key_scale = jnp.ones((keys.shape[0], 1, 1, 1), jnp.float32)
+            value_scale = key_scale
+        return cls(
+            keys=keys / key_scale,
+            values=values / value_scale,
+            key_scale=key_scale,
+            value_scale=value_scale,
+            trainable=jnp.asarray(trainable, dtype=jnp.bool),
+            meta=meta,
+            steps=jnp.asarray(steps, dtype=jnp.int32),
+        )
 
     @classmethod
     def from_prefix(
@@ -85,15 +141,14 @@ class Cartridge(eqx.Module):
         prefix: KVPrefix,
         *,
         freeze_first: bool = True,
+        unit_rms: bool = True,
         meta: CartridgeMeta | None = None,
     ) -> Cartridge:
         trainable = jnp.ones((prefix.length,), dtype=jnp.bool)
         if freeze_first:
             trainable = trainable.at[0].set(False)
-        return cls(
-            keys=prefix.keys.astype(jnp.float32),
-            values=prefix.values.astype(jnp.float32),
-            trainable=trainable,
+        return cls.from_physical(
+            prefix.keys, prefix.values, trainable=trainable, unit_rms=unit_rms,
             meta=meta or CartridgeMeta(init_tokens=prefix.length),
         )
 
@@ -104,6 +159,7 @@ class Cartridge(eqx.Module):
         token_ids: Int[Array, "p"] | np.ndarray,
         *,
         freeze_first: bool = True,
+        unit_rms: bool = True,
         meta: CartridgeMeta | None = None,
     ) -> Cartridge:
         """Initialise from the model's own KV cache over `token_ids`.
@@ -120,7 +176,7 @@ class Cartridge(eqx.Module):
         prefix = KVPrefix.from_cache(out.cache)
         if meta is None:
             meta = CartridgeMeta(init_tokens=int(ids.shape[1]))
-        return cls.from_prefix(prefix, freeze_first=freeze_first, meta=meta)
+        return cls.from_prefix(prefix, freeze_first=freeze_first, unit_rms=unit_rms, meta=meta)
 
     # --- training support -------------------------------------------------
 
@@ -148,10 +204,14 @@ class Cartridge(eqx.Module):
     # --- persistence -------------------------------------------------------
 
     def save(self, path: str | Path) -> None:
+        """The parameters as the optimiser holds them, plus their scales, so a
+        save/load round trip is bit-exact. A file without scale tensors (from
+        before the reparameterization) holds the physical KV."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         st.save_file(
-            {"keys": self.keys, "values": self.values, "trainable": self.trainable,
+            {"keys": self.keys, "values": self.values, "key_scale": self.key_scale,
+             "value_scale": self.value_scale, "trainable": self.trainable,
              "steps": self.steps},
             str(path),
             metadata={"cartridge": self.meta.to_json()},
@@ -166,13 +226,29 @@ class Cartridge(eqx.Module):
         with safe_open(str(path), framework="flax") as f:
             raw: dict[str, Any] = f.metadata() or {}
         meta = CartridgeMeta.from_json(raw.get("cartridge", "{}"))
+        steps = jnp.asarray(tensors.get("steps", 0), dtype=jnp.int32)
+        if "key_scale" not in tensors:
+            # Legacy file: physical KV. Re-parameterize on the way in.
+            return cls.from_physical(
+                tensors["keys"], tensors["values"], trainable=tensors["trainable"],
+                meta=meta, steps=steps,
+            )
         return cls(
             keys=jnp.asarray(tensors["keys"], dtype=jnp.float32),
             values=jnp.asarray(tensors["values"], dtype=jnp.float32),
+            key_scale=jnp.asarray(tensors["key_scale"], dtype=jnp.float32),
+            value_scale=jnp.asarray(tensors["value_scale"], dtype=jnp.float32),
             trainable=jnp.asarray(tensors["trainable"], dtype=jnp.bool),
             meta=meta,
-            steps=jnp.asarray(tensors.get("steps", 0), dtype=jnp.int32),
+            steps=steps,
         )
+
+
+def _layer_rms(x: Float[Array, "layers p kv_heads head_dim"]) -> Float[Array, "layers 1 1 1"]:
+    """Per-layer root-mean-square over slots, heads and dims; one for an empty
+    or all-zero layer so the division is a no-op there."""
+    rms = jnp.sqrt(jnp.mean(x * x, axis=(1, 2, 3), keepdims=True))
+    return jnp.where(rms > 0, rms, 1.0)
 
 
 def compose(model, *cartridges: Cartridge, reposition: bool = True) -> KVPrefix:

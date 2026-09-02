@@ -80,8 +80,8 @@ for name, src in CARTS.items():
     for li in LAYERS:
         q, k = jnp.asarray(sub[li]["q"]), jnp.asarray(sub[li]["k"])
         o_proj = model.model.language_model.layers[li].self_attn.o_proj
-        params = {"K": jnp.asarray(cart.keys[li], jnp.float32),
-                  "V": jnp.asarray(cart.values[li], jnp.float32)}
+        params = {"K": jnp.asarray(cart.physical_keys[li], jnp.float32),
+                  "V": jnp.asarray(cart.physical_values[li], jnp.float32)}
         mass, _ = slot_diagnostics(o_proj, q, k, None, np.asarray(lmask), params)  # (8, P)
         fh = mass / mass.sum(axis=1, keepdims=True)
         m = mass.sum(axis=0)

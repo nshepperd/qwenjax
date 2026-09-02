@@ -139,13 +139,15 @@ def attnmse_loss_graduated(
     - instance noise: Gaussian noise on the keys, scaled per layer by the
       keys' own RMS, gives cold slots random chances to win queries.
 
-    The frozen sink slot is exempt from both, so its behaviour is exact
-    throughout. At tau=1, sigma=0 this is `attnmse_loss` to the bit.
+    Both act on the physical keys (parameters times the per-layer scale),
+    so they mean the same thing under either parameterization. The frozen
+    sink slot is exempt from both, so its behaviour is exact throughout. At
+    tau=1, sigma=0 this is `attnmse_loss` to the bit.
     """
     t = jnp.minimum(cartridge.steps.astype(jnp.float32) / anneal_steps, 1.0)
     tau = tau0 + (1.0 - tau0) * t
     sigma = noise0 * (1.0 - t)
-    K = cartridge.keys
+    K = cartridge.physical_keys
     m = cartridge.trainable[None, :, None, None]
     rms = jnp.sqrt(jnp.mean(jax.lax.stop_gradient(K) ** 2, axis=(1, 2, 3), keepdims=True))
     key = jax.random.fold_in(jax.random.key(17), cartridge.steps)
@@ -154,7 +156,7 @@ def attnmse_loss_graduated(
     from .cache import KVPrefix
 
     prefix = KVPrefix(keys=Kp.astype(model.cache_dtype()),
-                      values=cartridge.values.astype(model.cache_dtype()))
+                      values=cartridge.physical_values.astype(model.cache_dtype()))
     return jnp.mean(attnmse_layers(model, cartridge, batch, prefix=prefix))
 
 

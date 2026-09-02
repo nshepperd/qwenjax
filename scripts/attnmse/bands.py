@@ -29,8 +29,8 @@ tokenizer = cli.load_tokenizer()
 corpus = cli.load_corpus(tokenizer, None)
 model = cli.load_model()
 init = cli.init_cartridge(model, tokenizer, corpus, 1024, cli.DESCRIPTION)
-K0 = np.asarray(init.keys, np.float32)   # (36, 1024, 8, 128)
-V0 = np.asarray(init.values, np.float32)
+K0 = np.asarray(init.physical_keys, np.float32)   # (36, 1024, 8, 128)
+V0 = np.asarray(init.physical_values, np.float32)
 
 CARTS = {
     "kl": REPO / "runs/cart/sweep-lr1e-2.safetensors",
@@ -41,8 +41,8 @@ CARTS = {
 out = {"wavelength": (2 * np.pi * 5e6 ** (np.arange(64) / 64)).tolist()}
 for name, path in CARTS.items():
     c = Cartridge.load(path)
-    dK = np.asarray(c.keys, np.float32) - K0
-    dV = np.asarray(c.values, np.float32) - V0
+    dK = np.asarray(c.physical_keys, np.float32) - K0
+    dV = np.asarray(c.physical_values, np.float32) - V0
     # band energy: (36 layers, 64 pairs), summed over slots and kv heads
     e = dK[..., :64] ** 2 + dK[..., 64:] ** 2
     band = e.sum(axis=(1, 2))
