@@ -43,8 +43,8 @@ def _rotary(model, position_ids):
 
 
 def teacher_targets(
-    model, batch: Batch,
-) -> tuple[Float[Array, "layers batch seq hidden"], Float[Array, "layers batch seq hidden"]]:
+    model, batch: Batch, *, context_kv: bool = False,
+):
     """Per-layer residual-stream inputs and attention outputs at suffix positions.
 
     Replays the text decoder loop of `Qwen3VLTextModel.__call__` (text-only:
@@ -52,24 +52,64 @@ def teacher_targets(
     residual add. Position ids and the KV mask come from the same resolution
     the real forward uses, so the capture is the teacher of `distill_loss`
     to the bit.
+
+    With `context_kv`, also returns the teacher's rotated keys and values over
+    the context positions, `(layers, batch, context, kv_heads, head_dim)`
+    each: the corpus KV, for attending the teacher's layer to a stream other
+    than the teacher's own (`attnmse_onpolicy_layers`).
     """
+    from .attention import apply_rotary_pos_emb
+
     lm = model.model.language_model
     ids, mask = batch.teacher_ids, batch.teacher_mask
     context = batch.context
+    b, s = ids.shape
     position_ids, _, _ = model.model._resolve_position_ids(
         ids, None, mask, None, None, None, None)
     pos_emb = _rotary(model, position_ids)
     kv_mask = mask.astype(jnp.bool)
     h = lm.embed_tokens(ids)
-    ins, outs = [], []
+    ins, outs, ks, vs = [], [], [], []
     for layer in lm.layers:
         ins.append(h[:, context:])
-        attn, _ = layer.self_attn(layer.input_layernorm(h), position_embeddings=pos_emb,
-                                  kv_mask=kv_mask)
+        x = layer.input_layernorm(h)
+        if context_kv:
+            a = layer.self_attn
+            k = a.k_norm(a.k_proj(x).reshape(b, s, a.num_kv_heads, a.head_dim))
+            v = a.v_proj(x).reshape(b, s, a.num_kv_heads, a.head_dim)
+            _, k = apply_rotary_pos_emb(k, k, *pos_emb)
+            ks.append(k[:, :context])
+            vs.append(v[:, :context])
+        attn, _ = layer.self_attn(x, position_embeddings=pos_emb, kv_mask=kv_mask)
         outs.append(attn[:, context:])
         h = h + attn
         h = h + layer.mlp(layer.post_attention_layernorm(h))
+    if context_kv:
+        return jnp.stack(ins), jnp.stack(outs), (jnp.stack(ks), jnp.stack(vs))
     return jnp.stack(ins), jnp.stack(outs)
+
+
+def student_inputs(model, cartridge: Cartridge, batch: Batch) -> Float[Array, "layers batch seq hidden"]:
+    """The student's own residual stream entering each layer, with the
+    cartridge in place: the queries the cartridge actually meets at inference.
+    No gradient flows through it (DAgger: the learner's states are data)."""
+    lm = model.model.language_model
+    prefix = cartridge.prefix(model.cache_dtype())
+    ids, mask = batch.student_ids, batch.student_mask
+    position_ids, _, _ = model.model._resolve_position_ids(
+        ids, None, mask, None, None, None, prefix.length)
+    pos_emb = _rotary(model, position_ids)
+    ones = jnp.ones((ids.shape[0], prefix.length), dtype=jnp.bool)
+    kv_mask = jnp.concatenate([ones, mask.astype(jnp.bool)], axis=1)
+    h = lm.embed_tokens(ids)
+    ins = []
+    for i, layer in enumerate(lm.layers):
+        ins.append(h)
+        attn, _ = layer.self_attn(layer.input_layernorm(h), position_embeddings=pos_emb,
+                                  kv_mask=kv_mask, prefix=prefix.layer(i))
+        h = h + attn
+        h = h + layer.mlp(layer.post_attention_layernorm(h))
+    return jax.lax.stop_gradient(jnp.stack(ins))
 
 
 def attnmse_layers(
@@ -124,6 +164,119 @@ def attnmse_loss(model, cartridge: Cartridge, batch: Batch) -> Float[Array, ""]:
     return jnp.mean(attnmse_layers(model, cartridge, batch))
 
 
+def attnmse_onpolicy_layers(
+    model, cartridge: Cartridge, batch: Batch, rollout: Cartridge | None = None, *,
+    alpha: float = 1.0, target: str = "dagger", beta: float = 0.0, eps: float = 1e-6,
+) -> Float[Array, "layers"]:
+    """Per-layer relative error with the STUDENT's residual stream as the query.
+
+    Teacher forcing across depth (`attnmse_layers`) trains layer l on the
+    teacher's stream; at inference layer l sees the student's stream, which
+    carries the accumulated error of every layer below, and a few percent per
+    layer compounds through 36. Here layer l's input is the student's own
+    stream `h_l^s` (one no-gradient forward with the cartridge in place), and
+    the per-layer losses remain decoupled given the captured streams.
+
+    Two targets for the student's attention output `a_l^s`:
+
+    - "dagger" (default): the teacher's layer on the student's stream over
+      the corpus KV, `attn_l(h_l^s; corpus)` -- the expert's action in the
+      state the learner is actually in. Drift at layer l+1 is drift at l plus
+      the local on-policy error plus the model's own response, so this local
+      error is the only thing that injects drift; zero everywhere reproduces
+      the teacher's stream exactly from the shared embedding.
+    - "corrective": `a_l^t + beta * (h_l^t - h_l^s)`, the teacher's output on
+      the student's queries plus a fraction of the inherited drift. At
+      `beta=1` it lands the post-attention residual exactly on the teacher's,
+      which is right in the limit and 25x out of scale in practice (residual
+      streams dwarf attention outputs; held-out KL rose above the untrained
+      cartridge's). `beta=0` is the plain on-policy-query variant.
+
+    Both are normalised by the teacher's attention-output power, like
+    `attnmse_layers`, and coincide with it when the streams coincide.
+    `alpha` mixes in the teacher-forced term: `alpha * on_policy +
+    (1 - alpha) * teacher_forced` per layer; `alpha=1` is pure on-policy.
+
+    `rollout` is the cartridge the student streams are computed with. With
+    `None` they come from `cartridge` itself, recomputed every step, which is
+    fully online: each step's gradient is taken on streams the previous step
+    just moved, and the loss is measured on streams that will move again
+    (over six Adam steps from a wrong cartridge it rose 0.104 -> 0.112).
+    DAgger proper freezes the learner's states for an iteration and trains
+    on the aggregate; pass a frozen copy, refreshed every N steps, and use
+    `alpha < 1` as the stand-in for the aggregated teacher-forced data.
+    """
+    if target not in ("corrective", "dagger"):
+        raise ValueError(f"unknown target {target!r}")
+    from .cache import KVCacheLayer
+
+    if batch.note_ids is not None:
+        raise ValueError("student notes are not supported by the teacher-forced loss: "
+                         "the teacher has no hidden states for note positions")
+    lm = model.model.language_model
+    ins_t, tgt_t, (k_ctx, v_ctx) = jax.lax.stop_gradient(
+        teacher_targets(model, batch, context_kv=True))
+    ins_s = student_inputs(model, cartridge if rollout is None else rollout, batch)
+    prefix = cartridge.prefix(model.cache_dtype())
+    ids, mask = batch.student_ids, batch.student_mask
+    context = batch.context
+    t_ids, t_mask = batch.teacher_ids, batch.teacher_mask
+    # Student geometry: suffix at p + i over [cartridge | suffix].
+    pos_s, _, _ = model.model._resolve_position_ids(ids, None, mask, None, None, None, prefix.length)
+    pos_s_emb = _rotary(model, pos_s)
+    ones = jnp.ones((ids.shape[0], prefix.length), dtype=jnp.bool)
+    kv_mask_s = jnp.concatenate([ones, mask.astype(jnp.bool)], axis=1)
+    # Teacher geometry for the same suffix: |context| + i over [corpus | suffix].
+    pos_t, _, _ = model.model._resolve_position_ids(t_ids, None, t_mask, None, None, None, None)
+    cos_t, sin_t = _rotary(model, pos_t)
+    pos_tc_emb = (cos_t[:, context:], sin_t[:, context:])
+    kv_mask_tc = jnp.concatenate([t_mask[:, :context].astype(jnp.bool), mask.astype(jnp.bool)],
+                                 axis=1)
+    m = batch.loss_mask[..., None]
+
+    def rel(x, ref, norm):
+        d = jnp.where(m, x.astype(jnp.float32) - ref.astype(jnp.float32), 0.0)
+        r = jnp.where(m, norm.astype(jnp.float32), 0.0)
+        return jnp.sum(d * d) / (jnp.sum(r * r) + eps)
+
+    losses = []
+    gate = jnp.zeros((), jnp.float32)
+    for i, layer in enumerate(lm.layers):
+        # See `attnmse_layers` for why the barrier and the checkpoint.
+        h_t, t_t, h_s, kc, vc = jax.lax.optimization_barrier(
+            (ins_t[i], tgt_t[i], ins_s[i], k_ctx[i], v_ctx[i], gate))[:5]
+
+        @jax.checkpoint
+        def one(h_t, t_t, h_s, kc, vc, pfx, layer=layer):
+            attn = layer.self_attn
+            x_s = layer.input_layernorm(h_s)
+            if target == "corrective":
+                t_op = t_t.astype(jnp.float32) + beta * (h_t.astype(jnp.float32)
+                                                         - h_s.astype(jnp.float32))
+            else:
+                t_op, _ = attn(x_s, position_embeddings=pos_tc_emb, kv_mask=kv_mask_tc,
+                               prefix=KVCacheLayer(keys=kc, values=vc))
+            o_s, _ = attn(x_s, position_embeddings=pos_s_emb, kv_mask=kv_mask_s, prefix=pfx)
+            loss = alpha * rel(o_s, jax.lax.stop_gradient(t_op), t_t)
+            if alpha < 1.0:
+                o_t, _ = attn(layer.input_layernorm(h_t), position_embeddings=pos_s_emb,
+                              kv_mask=kv_mask_s, prefix=pfx)
+                loss = loss + (1.0 - alpha) * rel(o_t, t_t, t_t)
+            return loss
+
+        losses.append(one(h_t, t_t, h_s, kc, vc, prefix.layer(i)))
+        gate = losses[-1]
+    return jnp.stack(losses)
+
+
+def attnmse_onpolicy_loss(model, cartridge: Cartridge, batch: Batch, rollout: Cartridge | None = None,
+                          *, alpha: float = 1.0, target: str = "dagger", beta: float = 0.0):
+    """Mean over layers of `attnmse_onpolicy_layers`. Drop-in for `distill_loss`;
+    `rollout` arrives as the trainer's pass-through argument."""
+    return jnp.mean(attnmse_onpolicy_layers(model, cartridge, batch, rollout, alpha=alpha,
+                                            target=target, beta=beta))
+
+
 def attnmse_loss_graduated(
     model, cartridge: Cartridge, batch: Batch, *,
     tau0: float = 1.0, noise0: float = 0.0, anneal_steps: int = 1000,
@@ -160,4 +313,5 @@ def attnmse_loss_graduated(
     return jnp.mean(attnmse_layers(model, cartridge, batch, prefix=prefix))
 
 
-__all__ = ["attnmse_layers", "attnmse_loss", "attnmse_loss_graduated", "teacher_targets"]
+__all__ = ["attnmse_layers", "attnmse_loss", "attnmse_loss_graduated", "attnmse_onpolicy_layers",
+           "attnmse_onpolicy_loss", "student_inputs", "teacher_targets"]

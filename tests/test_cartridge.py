@@ -8,6 +8,7 @@ Everything else -- gradients, shifting, composition -- is built on that.
 """
 from __future__ import annotations
 
+import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -326,6 +327,53 @@ def test_attnmse_training_step(model, tokenizer, tokens):
     np.testing.assert_array_equal(np.asarray(c.keys[:, 0]), np.asarray(cart.keys[:, 0]))
     np.testing.assert_array_equal(np.asarray(c.values[:, 0]), np.asarray(cart.values[:, 0]))
     assert not np.array_equal(np.asarray(c.keys[:, 1]), np.asarray(cart.keys[:, 1]))
+
+
+def test_attnmse_onpolicy(model, tokenizer, tokens):
+    """With the exact cartridge the student's stream is the teacher's, so the
+    on-policy error is bf16 drift like the teacher-forced one; with a wrong
+    cartridge it is orders larger, and a step under it lowers the loss."""
+    from qwen_jax.attnmse import attnmse_layers, attnmse_onpolicy_layers, attnmse_onpolicy_loss
+
+    ex = Example(
+        chunk_ids=tokenizer.encode(SYSTEM, add_special_tokens=False),
+        user=TURNS[0][1], assistant=TURNS[1][1],
+    )
+    batch = make_batch(tokenizer, [ex], description="", context=len(tokens.system), seq=64,
+                       pad_id=tokenizer.pad_token_id)
+    f_tf = jax.jit(attnmse_layers)
+    exact = Cartridge.init_from_tokens(model, np.asarray(tokens.system))
+    wrong_tokens = chat.encode(tokenizer, "This document is about the history of bicycles.", [])
+    wrong = Cartridge.init_from_tokens(model, np.asarray(wrong_tokens.system))
+    tf_exact = np.asarray(f_tf(model, exact, batch))
+    # The corrective target carries the residual-stream drift, and for the
+    # exact cartridge that drift is bf16 noise on vectors far larger than the
+    # attention outputs it is normalised by: ~1e-2 in deep layers, the
+    # target's noise floor. The dagger target is attention-output noise only.
+    for target, floor in (("corrective", 2e-2), ("dagger", 5e-3)):
+        f_op = jax.jit(functools.partial(attnmse_onpolicy_layers, target=target))
+        op_exact = np.asarray(f_op(model, exact, batch))
+        op_wrong = np.asarray(f_op(model, wrong, batch))
+        assert op_exact.shape == (len(model.model.language_model.layers),)
+        assert op_exact.mean() < floor, (target, op_exact)
+        assert op_wrong.mean() > 10 * op_exact.mean(), (target, op_wrong.mean(), op_exact.mean())
+    assert tf_exact.mean() < 5e-3
+
+    # A DAgger iteration: the student streams come from a frozen rollout
+    # cartridge (the trainer's pass-through argument), so the objective is
+    # stationary and six steps must lower it. Fully online (streams
+    # recomputed every step) the measured loss can rise while chasing.
+    batch2 = make_batch(tokenizer, [ex, ex], description="Below is an excerpt from a manual.",
+                        context=128, seq=64, pad_id=tokenizer.pad_token_id)
+    trainer = Trainer(optax.adam(1e-2), loss=attnmse_onpolicy_loss)
+    state = trainer.init(wrong)
+    losses = []
+    c = wrong
+    for _ in range(6):
+        c, state, loss = trainer.step(model, c, state, batch2, wrong)
+        losses.append(float(loss))
+    assert all(np.isfinite(losses)) and losses[-1] < losses[0], losses
+    np.testing.assert_array_equal(np.asarray(c.keys[:, 0]), np.asarray(wrong.keys[:, 0]))
 
 
 def test_probe_matches_prefix_path(model, tokens, prefix):

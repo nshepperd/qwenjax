@@ -195,6 +195,13 @@ def cmd_train(args):
         from qwen_jax.attnmse import attnmse_loss
 
         loss = attnmse_loss
+    elif args.loss == "onpolicy":
+        import functools
+
+        from qwen_jax.attnmse import attnmse_onpolicy_loss
+
+        loss = functools.partial(attnmse_onpolicy_loss, alpha=args.alpha, target=args.target,
+                                 beta=args.beta)
     trainer = Trainer(optax.adam(schedule), block=args.block, loss=loss)
     state = trainer.init(cart)
     t0 = time.time()
@@ -205,7 +212,12 @@ def cmd_train(args):
     recent = []
     while step < args.steps:
         for batch in batches_from(tokenizer, train, args, shuffle=True, seed=epoch):
-            cart, state, loss = trainer.step(model, cart, state, batch)
+            if args.loss == "onpolicy" and args.rollout_every:
+                if step % args.rollout_every == 0:
+                    rollout = cart
+                cart, state, loss = trainer.step(model, cart, state, batch, rollout)
+            else:
+                cart, state, loss = trainer.step(model, cart, state, batch)
             recent.append(float(loss))
             step += 1
             if step % args.log_every == 0 or step == args.steps:
@@ -316,9 +328,23 @@ def main():
     t.add_argument("--heldout")
     t.add_argument("--p", type=int, default=1024)
     t.add_argument("--steps", type=int, default=300)
-    t.add_argument("--loss", choices=("kl", "attnmse"), default="kl",
-                   help="training objective: blockwise logit KL, or teacher-forced "
-                        "attention-output MSE (held-out eval reports KL either way)")
+    t.add_argument("--loss", choices=("kl", "attnmse", "onpolicy"), default="kl",
+                   help="training objective: blockwise logit KL, teacher-forced "
+                        "attention-output MSE, or the same with the student's own "
+                        "stream as the query (held-out eval reports KL either way)")
+    t.add_argument("--alpha", type=float, default=1.0,
+                   help="onpolicy only: weight of the on-policy term; the rest is "
+                        "the teacher-forced term")
+    t.add_argument("--target", choices=("dagger", "corrective"), default="dagger",
+                   help="onpolicy only: see attnmse_onpolicy_layers")
+    t.add_argument("--beta", type=float, default=0.0,
+                   help="onpolicy corrective only: fraction of the inherited drift each "
+                        "layer is asked to absorb (0 = teacher's output on the "
+                        "student's queries)")
+    t.add_argument("--rollout-every", type=int, default=0,
+                   help="onpolicy only: recompute the student streams from a frozen copy "
+                        "of the cartridge every N steps (DAgger iterations); 0 = every "
+                        "step, fully online")
     t.add_argument("--raw-params", dest="unit_rms", action="store_false",
                    help="optimise the physical KV instead of the unit-RMS parameterization "
                         "(the pre-2026-09 behaviour, for controls)")

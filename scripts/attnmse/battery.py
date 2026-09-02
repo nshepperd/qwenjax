@@ -62,6 +62,12 @@ CARTS = {
     "anchor": HERE / "anchor.safetensors",
     "rms1anchor": HERE / "rms1anchor.safetensors",
 }
+# `battery.py name=path ...` scores just those cartridges and writes
+# summary-<names>.json / samples-<names>.txt instead of the overnight files.
+TAG = ""
+if sys.argv[1:]:
+    CARTS = {a.split("=", 1)[0]: Path(a.split("=", 1)[1]) for a in sys.argv[1:]}
+    TAG = "-" + "-".join(CARTS)
 
 f_attn = jax.jit(attnmse_loss)
 im_end = tokenizer.convert_tokens_to_ids(chat.IM_END)
@@ -108,6 +114,6 @@ for name, src in CARTS.items():
             gen = gen[: gen.index(im_end)]
         samples.append(f"\n######## [{name}] {qtext}\n{tokenizer.decode(gen)}")
 
-(HERE / "summary.json").write_text(json.dumps(summary, indent=1))
-(HERE / "samples-overnight.txt").write_text("\n".join(samples))
+(HERE / f"summary{TAG}.json").write_text(json.dumps(summary, indent=1))
+(HERE / f"samples{'-overnight' if not TAG else TAG}.txt").write_text("\n".join(samples))
 print("battery done", flush=True)
