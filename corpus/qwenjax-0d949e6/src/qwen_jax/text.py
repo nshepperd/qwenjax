@@ -1,0 +1,231 @@
+"""Text model components for Qwen3-VL."""
+from __future__ import annotations
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+from einops import rearrange
+from jaxtyping import Array, Bool, Float, Int
+
+from qwen_jax.config import Qwen3VLTextConfig
+
+from .attention import Qwen3VLTextAttention
+from .cache import KVCache, KVCacheLayer, KVPrefix
+from .linear import Embedding, RMSNorm
+from .mlp import Qwen3VLTextMLP
+from .rope import Qwen3VLTextRotaryEmbedding
+
+
+class Qwen3VLTextDecoderLayer(eqx.Module):
+    """Qwen3-VL text decoder layer with pre-norm."""
+    input_layernorm: RMSNorm
+    self_attn: Qwen3VLTextAttention
+    post_attention_layernorm: RMSNorm
+    mlp: Qwen3VLTextMLP
+
+    def __init__(
+        self,
+        config: Qwen3VLTextConfig,
+    ):
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = Qwen3VLTextAttention(
+            config=config,
+        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = Qwen3VLTextMLP(config.hidden_size, config.intermediate_size)
+
+    @jax.remat
+    def __call__(
+        self,
+        hidden_states: Float[Array, "batch seq hidden"],
+        position_embeddings: tuple[Float[Array, "batch seq head_dim"], Float[Array, "batch seq head_dim"]],
+        *,
+        kv_mask: Bool[Array, "batch kv_seq"],
+        cache: KVCacheLayer | None = None,
+        cache_position: Int[Array, ""] | None = None,
+        prefix: KVCacheLayer | None = None,
+    ) -> tuple[Float[Array, "batch seq hidden"], KVCacheLayer | None]:
+        """Forward pass. See `Qwen3VLTextAttention.__call__` for the KV arguments."""
+        # Pre-norm self-attention
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, new_cache = self.self_attn(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            kv_mask=kv_mask,
+            cache=cache,
+            cache_position=cache_position,
+            prefix=prefix,
+        )
+        hidden_states = residual + hidden_states
+
+        # Pre-norm MLP
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states, new_cache
+
+
+class Qwen3VLTextModel(eqx.Module):
+    """Qwen3-VL text decoder with DeepStack integration.
+
+    DeepStack injects intermediate visual features from the vision encoder
+    into early layers of the text model.
+    """
+    # Config
+    config: Qwen3VLTextConfig = eqx.field(static=True)
+
+    # Layers
+    embed_tokens: Embedding
+    layers: tuple[Qwen3VLTextDecoderLayer, ...]
+    norm: RMSNorm
+    rotary_emb: Qwen3VLTextRotaryEmbedding
+
+    def __init__(
+        self,
+        config: Qwen3VLTextConfig,
+    ):
+        self.config = config
+        self.embed_tokens = Embedding(self.config.vocab_size, self.config.hidden_size)
+        self.layers = tuple(
+            Qwen3VLTextDecoderLayer(config=self.config)
+            for _ in range(self.config.num_hidden_layers)
+        )
+        self.norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+        self.rotary_emb = Qwen3VLTextRotaryEmbedding(
+            config=self.config,
+        )
+
+    def _deepstack_process(
+        self,
+        hidden_states: Float[Array, "batch seq hidden"],
+        visual_pos_masks: Bool[Array, "batch seq"],
+        visual_embeds: Float[Array, "num_visual_tokens hidden"],
+    ) -> Float[Array, "batch seq hidden"]:
+        """Inject visual embeddings at visual token positions.
+
+        Args:
+            hidden_states: Current hidden states (batch, seq, hidden)
+            visual_pos_masks: Boolean mask for visual positions (batch, seq)
+            visual_embeds: Visual embeddings to add (num_visual_tokens, hidden)
+
+        Returns:
+            Updated hidden states
+        """
+        visual_idx = jnp.cumsum(visual_pos_masks.flatten()) - 1
+        gathered = rearrange(
+            visual_embeds[visual_idx],
+            '(batch seq) hidden -> batch seq hidden',
+            batch=hidden_states.shape[0],
+        )
+        # Add visual embeddings at masked positions
+        # This is element-wise addition
+        hidden_states = jnp.where(
+            visual_pos_masks[..., None],
+            hidden_states + gathered,
+            hidden_states
+        )
+        return hidden_states
+
+    def __call__(
+        self,
+        input_ids: Int[Array, "batch seq"] | None = None,
+        inputs_embeds: Float[Array, "batch seq hidden"] | None = None,
+        position_ids: Int[Array, "3 batch seq"] | None = None,
+        kv_mask: Bool[Array, "batch kv_seq"] | None = None,
+        cache: KVCache | None = None,
+        cache_position: Int[Array, ""] | None = None,
+        prefix: KVPrefix | None = None,
+        visual_pos_masks: Float[Array, "batch seq"] | None = None,
+        deepstack_visual_embeds: tuple[Float[Array, "..."], ...] | None = None,
+    ) -> tuple[Float[Array, "batch seq hidden"], KVCache | None]:
+        """Forward pass.
+
+        Args:
+            input_ids: Token IDs (batch, seq). Either this or inputs_embeds required.
+            inputs_embeds: Pre-computed embeddings (batch, seq, hidden)
+            position_ids: 3D position IDs for MRoPE (3, batch, seq)
+            kv_mask: Which key slots hold real tokens, over the full key
+                sequence (cache capacity, prefix + input, or input). Defaults
+                to everything valid.
+            cache: Optional KV cache. Its `valid` mask is *not* consulted here --
+                the caller folds it into kv_mask (see `Qwen3VLModel`).
+            cache_position: Position in cache
+            prefix: Optional KV prefix attended to ahead of the input.
+            visual_pos_masks: Boolean mask for visual token positions (batch, seq)
+            deepstack_visual_embeds: Tuple of visual embeddings for DeepStack
+
+        Returns:
+            (hidden_states, new_cache) tuple
+        """
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        batch_size, seq_len, _ = inputs_embeds.shape
+
+        if cache is not None and prefix is not None:
+            raise ValueError("pass either a cache or a prefix, not both")
+        past_len: Int[Array, ""] | int = 0
+        if cache_position is not None:
+            past_len = cache_position
+        elif prefix is not None:
+            past_len = prefix.length
+
+        # Handle position IDs
+        if position_ids is None:
+            pos = jnp.arange(seq_len) + past_len
+            position_ids = jnp.broadcast_to(pos[None, None, :], (3, batch_size, seq_len))
+
+        if kv_mask is None:
+            kv_len = cache.max_seq_len if cache is not None else seq_len + int(past_len)
+            kv_mask = jnp.ones((batch_size, kv_len), dtype=jnp.bool)
+
+        # Compute position embeddings (MRoPE)
+        position_embeddings = self.rotary_emb(position_ids)
+        position_embeddings = jax.tree.map(lambda x: x.astype(self.embed_tokens.weight().dtype), position_embeddings)
+
+        hidden_states = inputs_embeds
+
+        # Process through layers
+        new_cache_layers = []
+        for layer_idx, layer in enumerate(self.layers):
+            layer_cache = cache.layers[layer_idx] if cache is not None else None
+            layer_prefix = prefix.layer(layer_idx) if prefix is not None else None
+
+            hidden_states, new_layer_cache = layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                kv_mask=kv_mask,
+                cache=layer_cache,
+                cache_position=cache_position,
+                prefix=layer_prefix,
+            )
+
+            if new_layer_cache is not None:
+                new_cache_layers.append(new_layer_cache)
+
+            # DeepStack: inject visual features after early layers
+            if deepstack_visual_embeds is not None and layer_idx < len(deepstack_visual_embeds):
+                hidden_states = self._deepstack_process(
+                    hidden_states,
+                    visual_pos_masks,
+                    deepstack_visual_embeds[layer_idx],
+                )
+
+        hidden_states = self.norm(hidden_states)
+
+        # Build new cache
+        new_cache = None
+        if cache is not None:
+            new_cache = KVCache(
+                layers=tuple(new_cache_layers),
+                position=cache.position + seq_len,
+                valid=cache.valid,
+            )
+
+        return hidden_states, new_cache
+
+
+__all__ = ["Qwen3VLTextDecoderLayer", "Qwen3VLTextModel"]

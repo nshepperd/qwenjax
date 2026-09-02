@@ -8,7 +8,9 @@
     python scripts/cartridge.py ask   --cartridge runs/cart/qwenjax.safetensors "What does KVPrefix.shift do?"
 
 The model is the Q4_K_M GGUF of Qwen3-VL-8B-Instruct, text only, the same
-one `bench/quantization.py` measures. The corpus is `src/qwen_jax`.
+one `bench/quantization.py` measures. The corpus is a frozen snapshot of
+`src/qwen_jax` under `corpus/` (see its README), so that editing the live
+package does not move the numbers.
 """
 from __future__ import annotations
 
@@ -27,11 +29,30 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+
+def enable_compilation_cache():
+    """Persistent XLA compilation cache, shared by every script that imports
+    this module (and the tests). The model is passed to jitted functions as
+    an argument rather than baked in, so executables are keyed on shapes and
+    code alone and hit across runs; a cartridge step or eval that took a
+    minute to compile loads in seconds. The directory is per JAX version:
+    different versions sharing one cache upset each other."""
+    cache_dir = os.environ.get("JAX_COMPILATION_CACHE_DIR",
+                               str(Path.home() / ".cache" / "jax-compilation" / jax.__version__))
+    jax.config.update("jax_compilation_cache_dir", cache_dir)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
+
+
+enable_compilation_cache()
+
 REPO = Path(__file__).resolve().parent.parent
 MODELS = Path(os.environ.get("QWEN_BENCH_MODELS", "/data/models"))
 HF = MODELS / "Qwen3-VL-8B-Instruct"
 GGUF = Path(os.environ.get("QWEN_BENCH_GGUF", MODELS / "Qwen3-VL-8B-Instruct-GGUF"))
 GGUF_FILE = GGUF / "Qwen3-VL-8B-Instruct-Q4_K_M.gguf"
+# Frozen snapshot of src/qwen_jax; file headers in the corpus text are
+# relative to this root, so they read `src/qwen_jax/<module>.py` as before.
+CORPUS_ROOT = REPO / "corpus" / "qwenjax-0d949e6"
 
 DESCRIPTION = (
     "Below is a section of the source code of qwen-jax, a JAX/Equinox "
@@ -60,9 +81,11 @@ def load_corpus(tokenizer, files: list[str] | None, root: str | None = None):
 
     if files:
         paths = [Path(f).resolve() for f in files]
+        root = Path(root).resolve() if root else REPO
     else:
-        paths = sorted((REPO / "src" / "qwen_jax").rglob("*.py"))
-    corpus = Corpus.from_files(tokenizer, paths, root=Path(root).resolve() if root else REPO)
+        paths = sorted((CORPUS_ROOT / "src" / "qwen_jax").rglob("*.py"))
+        root = Path(root).resolve() if root else CORPUS_ROOT
+    corpus = Corpus.from_files(tokenizer, paths, root=root)
     print(f"corpus: {len(paths)} files, {len(corpus)} tokens", flush=True)
     return corpus
 
@@ -91,7 +114,7 @@ def cmd_gen(args):
         print(f"\n[{ex.seed_kind}] USER: {ex.user}\nASSISTANT: {ex.assistant[:400]}")
 
 
-def init_cartridge(model, tokenizer, corpus, p: int, description: str):
+def init_cartridge(model, tokenizer, corpus, p: int, description: str, *, unit_rms: bool = True):
     """KV of `<|im_start|>system\\n{description}\\n\\n{first tokens of the corpus}`."""
     from qwen_jax import chat
     from qwen_jax.cartridge import Cartridge, CartridgeMeta
@@ -99,7 +122,7 @@ def init_cartridge(model, tokenizer, corpus, p: int, description: str):
     head = tokenizer.encode(chat.system_open(f"{description}\n\n"), add_special_tokens=False)
     ids = np.concatenate([np.asarray(head, np.int32), corpus.head(max(p - len(head), 0))])
     meta = CartridgeMeta(model=GGUF_FILE.name, init_tokens=len(ids), description=description)
-    return Cartridge.init_from_tokens(model, ids, meta=meta)
+    return Cartridge.init_from_tokens(model, ids, meta=meta, unit_rms=unit_rms)
 
 
 def batches_from(tokenizer, examples, args, *, shuffle: bool, seed: int = 0,
@@ -150,7 +173,8 @@ def cmd_train(args):
     if args.resume:
         cart = Cartridge.load(args.resume)
     else:
-        cart = init_cartridge(model, tokenizer, corpus, args.p, args.description)
+        cart = init_cartridge(model, tokenizer, corpus, args.p, args.description,
+                              unit_rms=args.unit_rms)
     print(f"cartridge: p={cart.length}, {cart.num_layers} layers, "
           f"{cart.keys.size * 2 * 4 / 1e6:.0f} MB of float32 parameters")
 
@@ -295,6 +319,9 @@ def main():
     t.add_argument("--loss", choices=("kl", "attnmse"), default="kl",
                    help="training objective: blockwise logit KL, or teacher-forced "
                         "attention-output MSE (held-out eval reports KL either way)")
+    t.add_argument("--raw-params", dest="unit_rms", action="store_false",
+                   help="optimise the physical KV instead of the unit-RMS parameterization "
+                        "(the pre-2026-09 behaviour, for controls)")
     t.add_argument("--lr", type=float, default=5e-3)
     t.add_argument("--warmup", type=int, default=20)
     t.add_argument("--decay-frac", type=float, default=0.2,
