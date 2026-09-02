@@ -211,29 +211,36 @@ class Trainer:
 
     optimizer: optax.GradientTransformation
     block: int = 128
+    loss: Callable[[Any, Cartridge, Batch], Array] | None = None
+    """The objective, `(model, cartridge, batch) -> scalar`; `None` is the
+    blockwise KL of `distill_loss` with this trainer's `block`."""
 
     def __post_init__(self):
-        # The optimiser is a bundle of functions, not arrays: bind it rather
-        # than pass it, so jit sees only the model, cartridge, state and batch.
-        self._step = jax.jit(functools.partial(self._step_impl, self.optimizer),
-                             static_argnames=("block",))
+        # The optimiser and loss are bundles of functions, not arrays: bind
+        # them rather than pass them, so jit sees only the model, cartridge,
+        # state and batch.
+        loss = self.loss or functools.partial(distill_loss, block=self.block)
+        # The optimiser state is consumed and replaced every step; donating it
+        # saves its full size (double the cartridge) at the step's peak.
+        self._step = jax.jit(functools.partial(self._step_impl, self.optimizer, loss),
+                             donate_argnums=(2,))
 
     def init(self, cartridge: Cartridge) -> Any:
         return self.optimizer.init(cartridge.params())
 
     @staticmethod
-    def _step_impl(optimizer, model, cartridge: Cartridge, opt_state, batch: Batch, *, block: int):
+    def _step_impl(optimizer, loss, model, cartridge: Cartridge, opt_state, batch: Batch):
         def loss_fn(params):
-            return distill_loss(model, cartridge.with_params(params), batch, block=block)
+            return loss(model, cartridge.with_params(params), batch)
 
-        loss, grads = jax.value_and_grad(loss_fn)(cartridge.params())
+        value, grads = jax.value_and_grad(loss_fn)(cartridge.params())
         grads = cartridge.mask_grads(grads)
         updates, opt_state = optimizer.update(grads, opt_state, cartridge.params())
         params = optax.apply_updates(cartridge.params(), updates)
-        return cartridge.with_params(params), opt_state, loss
+        return cartridge.with_params(params), opt_state, value
 
     def step(self, model, cartridge: Cartridge, opt_state, batch: Batch):
-        cartridge, opt_state, loss = self._step(model, cartridge, opt_state, batch, block=self.block)
+        cartridge, opt_state, loss = self._step(model, cartridge, opt_state, batch)
         return cartridge.advance(1), opt_state, loss
 
 

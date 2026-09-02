@@ -166,7 +166,12 @@ def cmd_train(args):
                         for k, v in row.items()), flush=True)
 
     schedule = wsd_schedule(args.lr, args.steps, warmup=args.warmup, decay_frac=args.decay_frac)
-    trainer = Trainer(optax.adam(schedule), block=args.block)
+    loss = None
+    if args.loss == "attnmse":
+        from qwen_jax.attnmse import attnmse_loss
+
+        loss = attnmse_loss
+    trainer = Trainer(optax.adam(schedule), block=args.block, loss=loss)
     state = trainer.init(cart)
     t0 = time.time()
     report(0, float("nan"))
@@ -287,6 +292,9 @@ def main():
     t.add_argument("--heldout")
     t.add_argument("--p", type=int, default=1024)
     t.add_argument("--steps", type=int, default=300)
+    t.add_argument("--loss", choices=("kl", "attnmse"), default="kl",
+                   help="training objective: blockwise logit KL, or teacher-forced "
+                        "attention-output MSE (held-out eval reports KL either way)")
     t.add_argument("--lr", type=float, default=5e-3)
     t.add_argument("--warmup", type=int, default=20)
     t.add_argument("--decay-frac", type=float, default=0.2,

@@ -249,6 +249,57 @@ def test_distillation_step(model, tokenizer, tokens):
     assert not np.array_equal(np.asarray(c.keys[:, 1]), np.asarray(cart.keys[:, 1]))
 
 
+def test_attnmse_exact_cartridge(model, tokenizer, tokens):
+    """With the real system KV as the cartridge and matching geometry, the
+    teacher-forced attention-output error is bf16 drift; a cartridge from the
+    wrong text is orders larger."""
+    from qwen_jax.attnmse import attnmse_loss
+
+    ex = Example(
+        chunk_ids=tokenizer.encode(SYSTEM, add_special_tokens=False),
+        user=TURNS[0][1], assistant=TURNS[1][1],
+    )
+    # context == |system| == p: no left padding, teacher and student geometry
+    # coincide exactly.
+    batch = make_batch(tokenizer, [ex], description="", context=len(tokens.system), seq=64,
+                       pad_id=tokenizer.pad_token_id)
+    f = jax.jit(attnmse_loss)
+    exact = Cartridge.init_from_tokens(model, np.asarray(tokens.system))
+    wrong_tokens = chat.encode(tokenizer, "This document is about the history of bicycles.", [])
+    wrong = Cartridge.init_from_tokens(model, np.asarray(wrong_tokens.system))
+    loss_exact = float(f(model, exact, batch))
+    loss_wrong = float(f(model, wrong, batch))
+    assert loss_exact < 5e-3, (loss_exact, loss_wrong)
+    assert loss_exact < 0.1 * loss_wrong, (loss_exact, loss_wrong)
+
+
+def test_attnmse_training_step(model, tokenizer, tokens):
+    """Same contract as `test_distillation_step`, under the attention-MSE loss."""
+    from qwen_jax.attnmse import attnmse_loss
+
+    wrong = chat.encode(tokenizer, "This document is about the history of bicycles.", [])
+    cart = Cartridge.init_from_tokens(model, np.asarray(wrong.system))
+    ex = Example(
+        chunk_ids=tokenizer.encode(SYSTEM, add_special_tokens=False),
+        user=TURNS[0][1], assistant=TURNS[1][1],
+    )
+    batch = make_batch(tokenizer, [ex, ex], description="Below is an excerpt from a manual.",
+                       context=128, seq=64, pad_id=tokenizer.pad_token_id)
+
+    trainer = Trainer(optax.adam(1e-2), loss=attnmse_loss)
+    state = trainer.init(cart)
+    losses = []
+    c = cart
+    for _ in range(6):
+        c, state, loss = trainer.step(model, c, state, batch)
+        losses.append(float(loss))
+    assert all(np.isfinite(losses)) and losses[0] > 0, losses
+    assert losses[-1] < losses[0], losses
+    np.testing.assert_array_equal(np.asarray(c.keys[:, 0]), np.asarray(cart.keys[:, 0]))
+    np.testing.assert_array_equal(np.asarray(c.values[:, 0]), np.asarray(cart.values[:, 0]))
+    assert not np.array_equal(np.asarray(c.keys[:, 1]), np.asarray(cart.keys[:, 1]))
+
+
 def test_probe_matches_prefix_path(model, tokens, prefix):
     """The dense-attention probe is the model: same logits, weights sum to one."""
     from qwen_jax.probe import probe
