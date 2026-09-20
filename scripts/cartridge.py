@@ -114,6 +114,53 @@ def cmd_gen(args):
         print(f"\n[{ex.seed_kind}] USER: {ex.user}\nASSISTANT: {ex.assistant[:400]}")
 
 
+def cmd_gen_pointed(args):
+    """Pointed self-study: every span of the corpus asked about once per pass."""
+    import json
+    import random
+
+    from qwen_jax.selfstudy import corpus_spans, pointed_self_study, save_examples
+
+    tokenizer = load_tokenizer()
+    corpus = load_corpus(tokenizer, args.files, args.root)
+    spans = corpus_spans(len(corpus), args.span_tokens)
+    hold = random.Random(args.holdout_seed)
+    heldout = sorted(hold.sample(range(len(spans)), int(round(args.holdout_frac * len(spans)))))
+    held = set(heldout)
+    active = [sp for i, sp in enumerate(spans) if i not in held]
+    if args.limit:
+        active = active[: args.limit]
+    model = load_model()
+    t = time.time()
+
+    def progress(stage, done, total):
+        print(f"  {stage} {done}/{total}  ({time.time() - t:.0f}s)", flush=True)
+
+    examples, stats = [], {}
+    key = jax.random.key(args.seed)
+    for p in range(args.passes):
+        key, sub = jax.random.split(key)
+        order = list(active)
+        random.Random(args.seed + p).shuffle(order)
+        ex, st = pointed_self_study(
+            model, tokenizer, corpus, spans=order, description=args.description, key=sub,
+            seed=args.seed + p, batch_size=args.batch, chunk_tokens=(args.chunk_min, args.chunk_max),
+            max_user_tokens=args.max_user, max_assistant_tokens=args.max_assistant,
+            temperature=args.temperature, style=args.style, progress=progress,
+        )
+        examples += ex
+        for k, v in st.items():
+            stats[k] = stats.get(k, 0) + v
+        save_examples(examples, args.out)  # after every pass
+        print(f"pass {p + 1}/{args.passes}: {len(ex)} examples, {st}", flush=True)
+    side = Path(args.out).with_suffix(".spans.json")
+    side.write_text(json.dumps(dict(style=args.style, span_tokens=args.span_tokens, n_spans=len(spans),
+                                    heldout=heldout, passes=args.passes, stats=stats), indent=1))
+    print(f"wrote {len(examples)} examples to {args.out}; held-out spans in {side}")
+    for ex in examples[:4]:
+        print(f"\n[{ex.seed_kind}] span={ex.span}\nUSER: {ex.user}\nASSISTANT: {ex.assistant[:400]}")
+
+
 def init_cartridge(model, tokenizer, corpus, p: int, description: str, *, unit_rms: bool = True):
     """KV of `<|im_start|>system\\n{description}\\n\\n{first tokens of the corpus}`."""
     from qwen_jax import chat
@@ -321,6 +368,26 @@ def main():
     g.add_argument("--temperature", type=float, default=0.7)
     g.add_argument("--out", required=True)
 
+    gp = sub.add_parser("gen-pointed", help="pointed self-study: one conversation per corpus span per pass")
+    common(gp)
+    gp.add_argument("--style", choices=["anchored", "open"], default="anchored",
+                    help="anchored: task menu + must name what the span belongs to; "
+                         "open: one open-ended question about the section, no filter")
+    gp.add_argument("--passes", type=int, default=1)
+    gp.add_argument("--span-tokens", type=int, default=40)
+    gp.add_argument("--holdout-frac", type=float, default=0.2,
+                    help="fraction of spans never pointed at (still inside random chunks)")
+    gp.add_argument("--holdout-seed", type=int, default=0)
+    gp.add_argument("--limit", type=int, help="smoke test: only the first N active spans")
+    gp.add_argument("--seed", type=int, default=0)
+    gp.add_argument("--batch", type=int, default=8)
+    gp.add_argument("--chunk-min", type=int, default=512)
+    gp.add_argument("--chunk-max", type=int, default=2048)
+    gp.add_argument("--max-user", type=int, default=128)
+    gp.add_argument("--max-assistant", type=int, default=384)
+    gp.add_argument("--temperature", type=float, default=0.7)
+    gp.add_argument("--out", required=True)
+
     t = sub.add_parser("train")
     common(t)
     shapes(t)
@@ -374,7 +441,8 @@ def main():
     a.add_argument("question")
 
     args = p.parse_args()
-    {"gen": cmd_gen, "train": cmd_train, "eval": cmd_eval, "ask": cmd_ask}[args.cmd](args)
+    {"gen": cmd_gen, "gen-pointed": cmd_gen_pointed, "train": cmd_train, "eval": cmd_eval,
+     "ask": cmd_ask}[args.cmd](args)
 
 
 if __name__ == "__main__":

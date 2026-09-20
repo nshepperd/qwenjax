@@ -18,6 +18,18 @@ Two knobs shape the data distribution and both matter (section 5.3):
 Generation runs in batches through `model.generate`; prompts are left-padded
 and bucketed to a multiple of `pad_to` so a run compiles a handful of shapes,
 not one per batch.
+
+Pointed self-study (`pointed_self_study`) replaces the random chunk with a
+schedule: the corpus is cut into fixed spans and every span gets asked about
+once per pass, so coverage is uniform and a compute knob rather than a
+property of the seed set. The asker sees the chunk with the span marked and a
+seed that requires the message to be about the marked part and to name what
+it belongs to; the answerer sees the unmarked chunk. Both generations become
+training examples: the answer as usual, and the *question* as the reply to a
+plain seed that mentions no document and no marker -- writing a good question
+about a codebase needs the same knowledge of what is in it. The stored chunk
+is unmarked, so the teacher at distillation time sees exactly the context the
+cartridge stands in for; the marker only ever steers sampling.
 """
 from __future__ import annotations
 
@@ -167,6 +179,8 @@ class Example:
     cancellation remains -- the behaviour is *subtracted* rather than added.
     Empty means the student sees exactly the conversation, as before.
     """
+    span: list[int] | None = None
+    """Corpus token range [start, end) the example was pointed at, if any."""
 
     def to_json(self) -> str:
         return json.dumps(dataclasses.asdict(self))
@@ -295,14 +309,247 @@ def self_study(
     return examples[:n]
 
 
+# -----------------------------------------------------------------------------
+# Pointed self-study
+# -----------------------------------------------------------------------------
+
+MARK_OPEN, MARK_CLOSE = "<<MARKED>>", "<</MARKED>>"
+
+_POINTED_FRAME = (
+    "You are a person who has just read the document above and is about to "
+    "message an expert on it. Write that message. {task} The message must be "
+    f"about the part of the document between {MARK_OPEN} and {MARK_CLOSE}, and "
+    "must name the function, class, constant, field or file that part belongs "
+    "to, so the expert can find it without the document. Never mention that "
+    "anything is marked. Output only the message itself, in the first person, "
+    "with no preamble, no quotation marks and no sign-off."
+)
+
+# What the *student* is trained on for the question turn: the same request
+# without a document or a marker to point at.
+_PLAIN_FRAME = (
+    "You are a person who knows {subject} well and is about to message an "
+    "expert on it. Write that message. {task} Refer to specific parts by name. "
+    "Output only the message itself, in the first person, with no preamble, no "
+    "quotation marks and no sign-off."
+)
+
+# The loose variant (style="open"): one open-ended question about the marked
+# section, nothing about naming, no anchoring filter. What the asker writes is
+# whatever it finds worth asking about that section.
+_OPEN_FRAME = (
+    f"Write one open-ended question about the section of the document above "
+    f"between {MARK_OPEN} and {MARK_CLOSE}, for an expert on the document who "
+    "will answer it. Never mention that anything is marked. Output only the "
+    "question itself, with no preamble and no quotation marks."
+)
+_OPEN_PLAIN_FRAME = (
+    "Write one open-ended question about a specific part of {subject}, for an "
+    "expert on it who will answer it. Output only the question itself, with no "
+    "preamble and no quotation marks."
+)
+
+# kind -> (task for the asker, who sees the marked chunk; task for the student)
+POINTED_TASKS: dict[str, tuple[str, str]] = {
+    "structuring": (
+        "Ask the expert to lay the marked part out in a more structured form, "
+        "such as a table, list or tree.",
+        "Ask the expert to lay one specific part out in a more structured form, "
+        "such as a table, list or tree, and say which part.",
+    ),
+    "summarization": (
+        "Ask the expert to explain in a few sentences what the marked part does "
+        "and why.",
+        "Ask the expert to explain in a few sentences what one specific part does "
+        "and why.",
+    ),
+    "question": (
+        "Ask the expert one precise, detailed question whose answer requires the "
+        "marked part.",
+        "Ask the expert one precise, detailed question about a specific detail.",
+    ),
+    "relation": (
+        "Ask the expert how the marked part relates to something else in the "
+        "document.",
+        "Ask the expert how two specific parts relate to each other.",
+    ),
+    "use_case": (
+        "Describe something practical you want to do that involves the marked "
+        "part, and ask the expert how to do it.",
+        "Describe something practical you want to do and ask the expert how to "
+        "do it with what is there.",
+    ),
+    "reference": (
+        "Ask the expert for the exact definition of the marked part: the names, "
+        "types, defaults, and what it returns or holds.",
+        "Ask the expert for the exact definition of one specific function, "
+        "method, class or constant: the names, types, defaults, and what it "
+        "returns or holds.",
+    ),
+}
+
+_ANCHOR_STOP = frozenset("""
+self cls None True False return import from def class with as if else elif for
+while try except finally raise pass break continue lambda yield assert global
+nonlocal and or not in is del print len range dict list set tuple int float str
+bool type object super isinstance shape dtype axis args kwargs value values key
+keys item items data name names index size batch result results this that the
+""".split())
+
+
+def span_anchors(text: str) -> set[str]:
+    """Identifiers a message could use to name what a span belongs to."""
+    import re
+
+    return {t for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text)
+            if len(t) >= 4 and t not in _ANCHOR_STOP and not t.isdigit()}
+
+
+def is_anchored(message: str, anchors: set[str]) -> bool:
+    import re
+
+    return any(re.search(rf"(?<![A-Za-z0-9_]){re.escape(a)}(?![A-Za-z0-9_])", message)
+               for a in anchors)
+
+
+def corpus_spans(n_tokens: int, span_tokens: int) -> list[tuple[int, int]]:
+    return [(s, min(s + span_tokens, n_tokens)) for s in range(0, n_tokens, span_tokens)]
+
+
+def pointed_self_study(
+    model,
+    tokenizer,
+    corpus: Corpus,
+    *,
+    spans: list[tuple[int, int]],
+    description: str,
+    key,
+    subject: str = "this codebase",
+    seed: int = 0,
+    batch_size: int = 8,
+    chunk_tokens: tuple[int, int] = (512, 2048),
+    max_user_tokens: int = 128,
+    max_assistant_tokens: int = 384,
+    temperature: float = 0.7,
+    pad_to: int = 256,
+    tries: int = 3,
+    style: str = "anchored",
+    progress=None,
+) -> tuple[list[Example], dict]:
+    """One conversation per span, each pointed at its span; two examples per conversation.
+
+    `style="anchored"`: a task from POINTED_TASKS, the message must name what the
+    span belongs to (retried up to `tries` times). `style="open"`: one open-ended
+    question about the section, no naming requirement and no anchor filter; spans
+    with nothing nameable are still asked about.
+
+    Returns the examples and a stats dict (spans skipped for having nothing to
+    name, messages rejected for not naming anything, retries).
+    """
+    if style not in ("anchored", "open"):
+        raise ValueError(f"unknown style {style!r}")
+    open_style = style == "open"
+    rng = random.Random(seed)
+    ids = corpus.ids
+    n = len(ids)
+    kinds = ["open"] if open_style else sorted(POINTED_TASKS)
+    stats = {"spans": len(spans), "unanchorable": 0, "rejected": 0, "given_up": 0}
+
+    # ---- one job per span: a chunk that contains it, a task, and the anchors
+    jobs = []
+    for s, e in spans:
+        anchors = span_anchors(tokenizer.decode(ids[s:e], skip_special_tokens=False))
+        if not anchors:
+            stats["unanchorable"] += 1
+            if not open_style:
+                continue
+        length = min(rng.randint(*chunk_tokens), n)
+        lo, hi = max(0, e - length), min(s, n - length)
+        start = rng.randint(lo, hi) if hi >= lo else max(0, min(s, n - length))
+        chunk = ids[start:start + length]
+        kind = rng.choice(kinds)
+        jobs.append(dict(span=(s, e), chunk=chunk, start=start, kind=kind, anchors=anchors,
+                         tries=tries))
+
+    def decode(x):
+        return tokenizer.decode(x, skip_special_tokens=False)
+
+    def asker_prompt(job):
+        s, e = job["span"]
+        chunk, start = job["chunk"], job["start"]
+        pre, mid, post = chunk[: s - start], chunk[s - start: e - start], chunk[e - start:]
+        text = decode(pre) + MARK_OPEN + decode(mid) + MARK_CLOSE + decode(post)
+        seed_text = (_OPEN_FRAME if open_style
+                     else _POINTED_FRAME.format(task=POINTED_TASKS[job["kind"]][0]))
+        return chat.encode(tokenizer, f"{description}\n\n{text}", [("user", seed_text)],
+                           open_assistant=True).ids
+
+    # ---- A: the pointed question, with retries for unanchored messages
+    done, pending = [], list(jobs)
+    while pending:
+        batch, pending = pending[:batch_size], pending[batch_size:]
+        key, k1 = jax.random.split(key)
+        users = generate_batch(model, tokenizer, [asker_prompt(j) for j in batch],
+                               max_new_tokens=max_user_tokens, key=k1,
+                               temperature=temperature, pad_to=pad_to)
+        for job, u in zip(batch, users):
+            u = u.replace(MARK_OPEN, "").replace(MARK_CLOSE, "").strip()
+            if u and "marked" not in u.lower() and (open_style or is_anchored(u, job["anchors"])):
+                job["user"] = u
+                done.append(job)
+            else:
+                stats["rejected"] += 1
+                job["tries"] -= 1
+                if job["tries"] > 0:
+                    pending.append(job)
+                else:
+                    stats["given_up"] += 1
+        if progress is not None:
+            progress("ask", len(done), len(jobs))
+
+    # ---- B: the answer, with the unmarked chunk
+    for i in range(0, len(done), batch_size):
+        batch = done[i:i + batch_size]
+        key, k2 = jax.random.split(key)
+        prompts = [chat.encode(tokenizer, f"{description}\n\n{decode(j['chunk'])}",
+                               [("user", j["user"])], open_assistant=True).ids for j in batch]
+        answers = generate_batch(model, tokenizer, prompts, max_new_tokens=max_assistant_tokens,
+                                 key=k2, temperature=temperature, pad_to=pad_to)
+        for job, a in zip(batch, answers):
+            job["assistant"] = a
+        if progress is not None:
+            progress("answer", min(i + batch_size, len(done)), len(done))
+
+    examples = []
+    for job in done:
+        if not job.get("assistant"):
+            continue
+        chunk = job["chunk"].tolist()
+        span = list(job["span"])
+        plain = (_OPEN_PLAIN_FRAME.format(subject=subject) if open_style
+                 else _PLAIN_FRAME.format(subject=subject, task=POINTED_TASKS[job["kind"]][1]))
+        examples.append(Example(chunk_ids=chunk, user=job["user"], assistant=job["assistant"],
+                                seed_kind=f"pointed:{job['kind']}", span=span))
+        examples.append(Example(chunk_ids=chunk, user=plain, assistant=job["user"],
+                                seed_kind=f"ask:{job['kind']}", span=span))
+    return examples, stats
+
+
 __all__ = [
+    "MARK_CLOSE",
+    "MARK_OPEN",
+    "POINTED_TASKS",
     "SEED_PROMPTS",
     "SEED_TASKS",
     "Corpus",
     "Example",
+    "corpus_spans",
     "generate_batch",
+    "is_anchored",
     "load_examples",
+    "pointed_self_study",
     "sample_seed",
     "save_examples",
     "self_study",
+    "span_anchors",
 ]
