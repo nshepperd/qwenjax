@@ -46,6 +46,13 @@ picks, floored at 1/L, with the abstain letter left to the reward. What is not
 solved: the warm start pulls the letter choice toward abstaining through the
 shared cartridge even though its loss never touches the letter softmax, and the
 whole procedure costs ~0.10 of held-out distillation KL. Board: mtx3o4.
+
+Without the warm start (run7) the letter improves and the stated number never
+leaves 98-100%. Measured with scripts/mcq_graddiag.py: the part of the policy
+gradient that reaches the cartridge through the confidence logits is ~1.6% of
+the letter's part, and a confidence temperature, held or annealed
+(`--conf-temp-anneal`, run8), leaves that ratio where it was.
+`--conf-grad-match R` rescales the confidence part to R times the letter's.
 """
 from __future__ import annotations
 
@@ -479,6 +486,14 @@ def anchor_loss(model, cart, ref_prefix, batch, *, block=128):
     return blockwise_kl(model.get_lm_head(), hidden, jax.lax.stop_gradient(ref_hidden), batch.loss_mask, block=block)
 
 
+def conf_temp_at(rl_step: int, start: float, anneal: int) -> float:
+    """Exploration temperature at the `rl_step`-th (0-based) policy-gradient
+    step: `start`, decayed geometrically to 1 over `anneal` steps."""
+    if anneal <= 0 or rl_step < 0:
+        return start
+    return start ** max(1.0 - rl_step / anneal, 0.0)
+
+
 def cmd_train(args):
     import optax
 
@@ -507,14 +522,14 @@ def cmd_train(args):
     policy_fn = jax.jit(functools.partial(policy, toks=toks))
     summ = functools.partial(summarise, bonus=args.bonus, wrong_penalty=penalty, abstain=abstain)
 
-    def rl_grad(model, cart, batch, beta):
+    def rl_grad(model, cart, batch, beta, temp, scale):
         f = lambda params: mcq_loss(model, cart.with_params(params), batch, beta, toks, normalize=args.normalize,
-                                    bonus=args.bonus, conf_temp=args.conf_temp, wrong_penalty=penalty,
-                                    abstain=abstain)
+                                    bonus=args.bonus, conf_temp=temp, conf_grad_scale=scale,
+                                    wrong_penalty=penalty, abstain=abstain)
         (loss, aux), grads = jax.value_and_grad(f, has_aux=True)(cart.params())
         return grads, loss, aux
 
-    def sft_grad(model, cart, batch, beta):
+    def sft_grad(model, cart, batch, beta, temp, scale):
         f = lambda params: conf_sft_loss(model, cart.with_params(params), batch, toks)
         (loss, aux), grads = jax.value_and_grad(f, has_aux=True)(cart.params())
         return grads, loss, aux
@@ -580,11 +595,14 @@ def cmd_train(args):
         t0 = time.time()
         warm = step <= args.warm_steps
         grad_fn = sft_fn if warm else rl_fn
+        temp = conf_temp_at(step - args.warm_steps - 1, args.conf_temp, args.conf_temp_anneal)
         if len(order) < args.batch_q:
             order = list(range(len(train)))
             rng.shuffle(order)
         items, order = [train[i] for i in order[: args.batch_q]], order[args.batch_q:]
-        total, stats, mass = None, np.zeros(3), np.zeros(3)
+        scale = args.conf_grad_scale * (temp if args.conf_temp_rescale else 1.0)
+        match = args.conf_grad_match if not warm else 0.0
+        total, letter_part, stats, mass = None, None, np.zeros(3), np.zeros(3)
         micros = list(batched(items, args.micro_q))
         for group, _ in micros:
             idx = [r["_i"] for r in group]
@@ -603,10 +621,22 @@ def cmd_train(args):
                     weight[pick == L - 1] = 0.0  # leave the abstain letter's number to the reward
             b = make_rows(prompts, golds, toks, pad_id=tokenizer.pad_token_id, n_letters=L, ref_logp=ref_lp[idx],
                           target=target, weight=weight)
-            g, loss, (j, kl, m) = grad_fn(model, cart, b, jnp.float32(args.beta))
+            g, loss, (j, kl, m) = grad_fn(model, cart, b, jnp.float32(args.beta), jnp.float32(temp),
+                                          jnp.float32(1.0 if match else scale))
             total = g if total is None else jax.tree_util.tree_map(jnp.add, total, g)
+            if match:  # the gradient is linear in the scale: scale 0 is the letter's part
+                g0 = grad_fn(model, cart, b, jnp.float32(args.beta), jnp.float32(temp), jnp.float32(0.0))[0]
+                letter_part = g0 if letter_part is None else jax.tree_util.tree_map(jnp.add, letter_part, g0)
             stats += np.array([float(loss), float(j), float(kl)])
             mass += np.asarray(m)
+        conf_factor = scale
+        if match:
+            # Rescale the confidence's part of the batch gradient to `match` times the letter's norm.
+            conf_part = cart.mask_grads(jax.tree_util.tree_map(jnp.subtract, total, letter_part))
+            letter_part = cart.mask_grads(letter_part)
+            norm = lambda t: float(optax.global_norm(jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), t)))
+            conf_factor = match * norm(letter_part) / max(norm(conf_part), 1e-12)
+            total = jax.tree_util.tree_map(lambda a, c: a + conf_factor * c, letter_part, conf_part)
         total = jax.tree_util.tree_map(lambda x: x / len(micros), total)
         a_kl = 0.0
         if anchors:
@@ -618,10 +648,10 @@ def cmd_train(args):
         cart = cart.with_params(optax.apply_updates(cart.params(), updates)).advance(1)
         loss, j, kl = stats / len(micros)
         row = dict(step=step, phase="warm" if warm else "rl", loss=float(loss), objective=float(j), kl=float(kl),
-                   anchor_kl=a_kl, format_mass=(mass / len(micros)).tolist(), t=time.time() - t0)
+                   anchor_kl=a_kl, conf_temp=temp, conf_factor=float(conf_factor), format_mass=(mass / len(micros)).tolist(), t=time.time() - t0)
         with open(out / "log.jsonl", "a") as f:
             f.write(json.dumps(row) + "\n")
-        print(f"  {row['phase']:4s} {step:4d}  {'CE' if warm else 'E[R]'} {j:6.3f}  KL {kl:.4f}  anchorKL {a_kl:.4f}  "
+        print(f"  {row['phase']:4s} {step:4d}  {'CE' if warm else 'E[R]'} {j:6.3f}  KL {kl:.4f}  anchorKL {a_kl:.4f}  T {temp:.2f} x{conf_factor:.3g}  "
               f"mass {row['format_mass'][0]:.3f}/{row['format_mass'][1]:.3f}/{row['format_mass'][2]:.3f}  "
               f"[{row['t']:.1f}s]", flush=True)
         last = step == args.warm_steps + args.steps
@@ -726,6 +756,15 @@ def main():
                    help="cost of a wrong answer letter other than the abstain letter (tried at 1: no difference)")
     t.add_argument("--conf-temp", type=float, default=1.0,
                    help="exploration temperature on the confidence softmaxes, inside the objective only")
+    t.add_argument("--conf-temp-anneal", type=int, default=0,
+                   help="decay --conf-temp geometrically to 1 over this many RL steps (0 = hold it constant)")
+    t.add_argument("--conf-temp-rescale", action="store_true",
+                   help="multiply the confidence gradient by the temperature (undo the 1/T of the tempered softmax)")
+    t.add_argument("--conf-grad-scale", type=float, default=1.0,
+                   help="weight of the gradient through the confidence logits relative to the letter's")
+    t.add_argument("--conf-grad-match", type=float, default=0.0,
+                   help="rescale the confidence's part of each batch gradient to this multiple of the letter's "
+                        "norm (0 = off; costs a second backward pass)")
     t.add_argument("--normalize", action="store_true", help="GRPO-style per-question advantage standardisation")
     t.add_argument("--eval-every", type=int, default=10)
     t.add_argument("--save-every", type=int, default=10)

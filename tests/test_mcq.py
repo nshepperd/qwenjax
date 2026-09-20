@@ -139,3 +139,30 @@ def test_summarise_with_abstain_splits_real_and_out_of_corpus():
     logp[2, 4, 10] = 0.0  # out-of-corpus, abstains: caught
     s = summarise(logp, np.asarray([1, 0, 4]), abstain=True, wrong_penalty=1.0)
     assert s["caught"] == 1.0 and s["abstain_in"] == 0.5 and s["selective_acc"] == 1.0 and s["acc_in"] == 0.5
+
+
+def test_conf_temp_anneals_geometrically_to_one():
+    from mcq_rl import conf_temp_at
+
+    assert conf_temp_at(0, 4.0, 0) == conf_temp_at(99, 4.0, 0) == 4.0  # no anneal: constant
+    assert conf_temp_at(0, 4.0, 60) == 4.0
+    assert conf_temp_at(30, 4.0, 60) == pytest.approx(2.0)
+    assert conf_temp_at(60, 4.0, 60) == conf_temp_at(99, 4.0, 60) == 1.0
+    assert conf_temp_at(-5, 4.0, 60) == 4.0  # warm-start steps
+
+
+def test_conf_grad_scale_scales_only_the_confidence_gradient():
+    from qwen_jax.mcq import scale_grad
+
+    ll, ld, lb = _logits(3, q=2)
+    r = reward_table(jnp.asarray([1, 2]))
+
+    def j(ll, ld, lb, scale, temp):
+        return jnp.sum(jnp.exp(outcome_logprobs(ll, scale_grad(ld, scale) / temp, scale_grad(lb, scale) / temp)) * r)
+
+    base = jax.grad(j, argnums=(0, 1, 2))(ll, ld, lb, 1.0, 2.0)
+    up = jax.grad(j, argnums=(0, 1, 2))(ll, ld, lb, 5.0, 2.0)
+    np.testing.assert_allclose(j(ll, ld, lb, 5.0, 2.0), j(ll, ld, lb, 1.0, 2.0), rtol=1e-6)
+    np.testing.assert_allclose(up[0], base[0], rtol=1e-5, atol=1e-7)
+    np.testing.assert_allclose(up[1], 5.0 * base[1], rtol=1e-5, atol=1e-7)
+    np.testing.assert_allclose(up[2], 5.0 * base[2], rtol=1e-5, atol=1e-7)

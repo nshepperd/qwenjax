@@ -222,9 +222,14 @@ def policy(model, prefix, batch: MCQBatch, toks: AnswerTokens):
     return outcome_logprobs(*logits), mass
 
 
+def scale_grad(x, scale):
+    """`x`, with the gradient flowing back through it multiplied by `scale`."""
+    return scale * x + (1.0 - scale) * jax.lax.stop_gradient(x)
+
+
 def mcq_loss(model, cartridge, batch: MCQBatch, beta, toks: AnswerTokens, *,
              normalize: bool = False, bonus: float = BONUS, conf_temp: float = 1.0,
-             wrong_penalty: float = 0.0, abstain: bool = False):
+             conf_grad_scale: float = 1.0, wrong_penalty: float = 0.0, abstain: bool = False):
     """-E[R] + beta * KL(pi || pi_ref), both exact over the L x 11 responses.
 
     `normalize` is GRPO's per-question standardisation, computed from the exact
@@ -232,15 +237,24 @@ def mcq_loss(model, cartridge, batch: MCQBatch, beta, toks: AnswerTokens, *,
 
     `conf_temp` > 1 takes the expectation under a policy whose *confidence*
     softmaxes are flattened by that temperature (the analogue of rolling out at
-    a high sampling temperature). It did not help (runs/mcq/run2-temp4): the
-    real probability of a low confidence needs ~10 nats before the greedy
-    answer changes. Kept for the record; the warm start is what works.
+    a high sampling temperature). Held constant it did not help
+    (runs/mcq/run2-temp4): the real probability of a low confidence needs ~10
+    nats before the greedy answer changes. It may be traced, so the caller can
+    anneal it to 1 without recompiling.
+
+    `conf_grad_scale` multiplies the gradient that reaches the parameters
+    through the confidence logits and leaves every value alone. The confidence
+    gradient is pi(c) * A(c) with A a Brier difference, against the letter's
+    pi (1 - pi) * bonus in the same parameters; tempering alone still carries a
+    1/T, so `conf_grad_scale = conf_temp` is the gradient with respect to the
+    tempered logits.
     """
     (ll, ld, lb), mass = decision_logits(model, cartridge.prefix(model.cache_dtype()), batch, toks)
     logp = outcome_logprobs(ll, ld, lb)
     r = reward_table(batch.gold, logp.shape[1], bonus=bonus, wrong_penalty=wrong_penalty, abstain=abstain)
     j = jnp.sum(jnp.exp(logp) * r, axis=(-2, -1))
-    p = jnp.exp(outcome_logprobs(ll, ld / conf_temp, lb / conf_temp)) if conf_temp != 1.0 else jnp.exp(logp)
+    ld_s, lb_s = scale_grad(ld, conf_grad_scale), scale_grad(lb, conf_grad_scale)
+    p = jnp.exp(outcome_logprobs(ll, ld_s / conf_temp, lb_s / conf_temp))
     if normalize:
         ps = jax.lax.stop_gradient(p)
         mean = jnp.sum(ps * r, axis=(-2, -1), keepdims=True)
