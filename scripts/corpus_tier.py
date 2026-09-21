@@ -9,6 +9,7 @@ hence the cartridge's initialisation, are the same in every tier.
 
     python scripts/corpus_tier.py list
     python scripts/corpus_tier.py make --n-files 4 [--out runs/tiers/f04]
+    python scripts/corpus_tier.py add-mcq --tier runs/tiers/f04 --extra checked.jsonl
 
 `make` keeps a self-study conversation or a reader question when its whole
 source chunk lies inside the tier, a multiple-choice question when its span
@@ -19,12 +20,19 @@ Written to the out directory: `files.txt` (for `--files`; pass
 fixed 1-in-`--heldout-every` sample of the pointed conversations, the same
 ones in every tier, removed from `selfstudy.jsonl` with their `ask:` twins), `mcq-train.jsonl`,
 `mcq-test.jsonl`, `recall-items.jsonl`, `reader-qa.jsonl` and `tier.json`.
+
+A small tier inherits too few multiple-choice training questions to train on.
+`add-mcq` writes `mcq-train+.jsonl`: the tier's training set plus questions
+from further `mcq_rl.py gen --files ... --seed k` passes over the tier (after
+`mcq_rl.py check`), leaving out any whose span or wording is in the tier's
+test set or already present.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import random
 import re
 import sys
 from pathlib import Path
@@ -118,6 +126,28 @@ def cmd_make(args):
     print(json.dumps(counts, indent=1))
 
 
+def cmd_add_mcq(args):
+    tier = Path(args.tier)
+    train, test = read_jsonl(tier / "mcq-train.jsonl"), read_jsonl(tier / "mcq-test.jsonl")
+    norm = lambda q: " ".join(q.lower().split())
+    test_spans = {tuple(r["span"]) for r in test if r["kind"] == "in"}
+    seen = {norm(r["question"]) for r in train + test}
+    added, skipped = [], dict(test_span=0, duplicate=0)
+    for r in read_jsonl(args.extra):
+        if tuple(r["span"]) in test_spans:
+            skipped["test_span"] += 1
+        elif norm(r["question"]) in seen:
+            skipped["duplicate"] += 1
+        else:
+            seen.add(norm(r["question"]))
+            added.append(dict(r, abstain=True, kind="in"))
+    rows = train + added
+    random.Random(args.seed).shuffle(rows)
+    write_jsonl(tier / "mcq-train+.jsonl", rows)
+    print(f"{tier / 'mcq-train+.jsonl'}: {sum(r['kind'] == 'in' for r in rows)} in-corpus "
+          f"({len(added)} added; skipped {skipped}) + {sum(r['kind'] == 'out' for r in rows)} out-of-corpus")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -135,6 +165,11 @@ def main():
     m.add_argument("--reader-qa", default=str(REPO / "runs/reader/qa.jsonl"))
     m.add_argument("--out")
     m.set_defaults(fn=cmd_make)
+    a = sub.add_parser("add-mcq")
+    a.add_argument("--tier", required=True)
+    a.add_argument("--extra", required=True, help="train.jsonl written by `mcq_rl.py check --test-frac 0`")
+    a.add_argument("--seed", type=int, default=0)
+    a.set_defaults(fn=cmd_add_mcq)
     args = ap.parse_args()
     args.fn(args)
 
