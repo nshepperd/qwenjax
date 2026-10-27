@@ -132,6 +132,12 @@ class Qwen3VLVisionAttention(eqx.Module):
         return self.proj(attn_output)
 
 
+# Below this many queries a cached attention call takes the XLA path; see
+# masked_causal_attention. fa4 tiles queries 64 rows at a time, so these
+# calls would leave its tiles mostly empty anyway.
+_XLA_DECODE_MAX_QUERIES = 16
+
+
 def masked_causal_attention(
     q: Float[Array, "batch seq heads head_dim"],
     k: Float[Array, "batch kv_seq kv_heads head_dim"],
@@ -151,9 +157,12 @@ def masked_causal_attention(
     dtype of q.
     """
     batch_size, seq_len = q.shape[:2]
-    # The fa4 kernels tile shared memory by head_dim and 256-dim heads
-    # (Qwen3.5) exceed the sm_120 budget; route those to the XLA path.
-    use_flash = axla.use_flash() and q.shape[-1] <= 128
+    # A few queries against a cache (decode) go to XLA: its score matrix is
+    # then tiny, and fa4 has no split-KV, so one CTA per head walks the
+    # whole cache -- 10x slower at Qwen3.5's shape (24q/4kv heads, dim 256,
+    # 32K cache: 1.74 ms vs 0.18 ms per layer on the 5070 Ti).
+    decode = cache_position is not None and seq_len <= _XLA_DECODE_MAX_QUERIES
+    use_flash = axla.use_flash() and not decode
     dtype = q.dtype
     if dtype == jnp.float32 and use_flash:
         # The flash kernel only takes 16-bit inputs; the XLA path does not
