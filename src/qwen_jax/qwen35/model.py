@@ -14,10 +14,9 @@ import jax.numpy as jnp
 from einops import rearrange
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
-from qwen_jax import equinox_utils as eu
+from qwen_jax import causal_lm
 from qwen_jax.linear import Linear
 from qwen_jax.mrope import get_rope_index
-from qwen_jax.utils.indexing import gather
 from qwen_jax.utils.pjit import pjit
 from qwen_jax.vision import Qwen3VLVisionModel
 
@@ -38,12 +37,7 @@ class Qwen35Output:
     last_logits: Float[Array, "batch vocab"] | None = None
 
 
-@jax.tree_util.register_dataclass
-@dataclass
-class Qwen35GenerateOutput:
-    tokens: Int[Array, "batch seq"]
-    cache: Qwen35Cache | None = None
-    logits: Float[Array, "batch seq vocab"] | None = None
+Qwen35GenerateOutput = causal_lm.GenerateOutput
 
 
 class Qwen35Model(eqx.Module):
@@ -224,28 +218,14 @@ class Qwen35ForConditionalGeneration(eqx.Module):
             )
 
     def get_lm_head(self) -> Linear:
-        if self.config.tie_word_embeddings:
-            return eu.replace(
-                Linear(
-                    in_features=self.config.text_config.hidden_size,
-                    out_features=self.vocab_size,
-                    use_bias=False,
-                ),
-                weight=self.model.language_model.embed_tokens.weight,
-                bias=None,
-            )
-        assert self.lm_head is not None
-        return self.lm_head
+        return causal_lm.lm_head(self.lm_head, self.model.language_model.embed_tokens)
 
-    def _create_cache(self, batch_size: int, max_seq_len: int) -> Qwen35Cache:
-        cache_dtype = self.model.language_model.embed_tokens.weight().dtype
-        if cache_dtype == jnp.float32:
-            cache_dtype = jnp.bfloat16
+    def create_cache(self, batch_size: int, max_seq_len: int, dtype=None) -> Qwen35Cache:
         return Qwen35Cache.create(
             self.config.text_config,
             batch_size=batch_size,
             max_seq_len=max_seq_len,
-            dtype=cache_dtype,
+            dtype=dtype or causal_lm.cache_dtype(self.model.language_model.embed_tokens),
         )
 
     @pjit(static_argnames=("use_cache", "last_logit_only"))
@@ -263,7 +243,7 @@ class Qwen35ForConditionalGeneration(eqx.Module):
         last_logit_only: bool = False,
     ) -> Qwen35Output:
         if use_cache and cache is None:
-            cache = self._create_cache(input_ids.shape[0], input_ids.shape[1])
+            cache = self.create_cache(input_ids.shape[0], input_ids.shape[1])
 
         hidden_states, new_cache, new_rope_deltas = self.model(
             input_ids=input_ids,
@@ -278,17 +258,7 @@ class Qwen35ForConditionalGeneration(eqx.Module):
         )
 
         if last_logit_only:
-            batch_size, seq_len = input_ids.shape
-            if attention_mask is not None:
-                mask_slice = attention_mask[:, :seq_len]
-                positions = jnp.arange(seq_len)
-                last_idx = jnp.max(
-                    positions[None, :] * (mask_slice == 1).astype(jnp.int32),
-                    axis=-1,
-                )
-            else:
-                last_idx = jnp.full((batch_size,), seq_len - 1, dtype=jnp.int32)
-            last_hidden = gather('b s h, b [s] -> b h', hidden_states, last_idx)
+            last_hidden = causal_lm.last_hidden(hidden_states, attention_mask)
             last_logits = self.get_lm_head()(last_hidden)
             return Qwen35Output(
                 logits=None,
@@ -325,24 +295,31 @@ class Qwen35ForConditionalGeneration(eqx.Module):
         pad_token_id: int = 0,
         mm_token_type_ids: Int[Array, "batch seq"] | None = None,
     ) -> Qwen35GenerateOutput:
-        """Generate tokens; see Qwen3VLForConditionalGeneration.generate."""
-        batch_size = input_ids.shape[0]
-        prompt_len = input_ids.shape[1]
+        """Sample `max_new_tokens` tokens after the prompt; see `causal_lm.decode`.
+
+        Args:
+            input_ids: Initial token IDs (prompt).
+            pixel_values: Image patches (required if images in prompt).
+            image_grid_thw: Grid dimensions for each image (T, H, W).
+            attention_mask: Padding mask for prompt (batch, seq).
+            max_new_tokens: Number of tokens to generate.
+            key: PRNG key for sampling.
+            temperature: Sampling temperature (0 = greedy).
+            progress_bar: Print each decode step.
+
+        Returns:
+            GenerateOutput: prompt + generated tokens, the final cache, and
+            (with return_logits) the generated positions' logits.
+        """
+        batch_size, prompt_len = input_ids.shape
         max_seq_len = prompt_len + max_new_tokens
-
         if cache is None:
-            cache = self._create_cache(batch_size, max_seq_len)
+            cache = self.create_cache(batch_size, max_seq_len)
+        attention_mask = causal_lm.pad_mask(attention_mask, batch_size, max_seq_len)
 
-        if attention_mask is None:
-            attention_mask = jnp.ones([batch_size, max_seq_len], dtype=jnp.int32)
-        elif attention_mask.shape[1] < max_seq_len:
-            attention_mask = jnp.pad(
-                attention_mask,
-                ((0, 0), (0, max_seq_len - attention_mask.shape[1])),
-                constant_values=1,
-            )
-
-        output = self(
+        # Prefill: the whole prompt, images included, projecting only the last
+        # real position through the lm_head.
+        prefill = self(
             input_ids=input_ids,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
@@ -352,84 +329,33 @@ class Qwen35ForConditionalGeneration(eqx.Module):
             mm_token_type_ids=mm_token_type_ids,
             last_logit_only=True,
         )
+        assert prefill.last_logits is not None and prefill.cache is not None
 
-        def sample(logits, key):
-            return jnp.where(
-                temperature > 0,
-                jax.random.categorical(key, logits / temperature, axis=-1),
-                jnp.argmax(logits, axis=-1),
-            )
-
-        assert output.last_logits is not None
-        first_token_logits = output.last_logits
-        key, subkey = jax.random.split(key)
-        first_token = sample(first_token_logits, subkey)
-        assert output.cache is not None
-        cache = output.cache
-
-        stop_active = stop_token_id >= 0
-        done_init = stop_active & (first_token == stop_token_id)
-        keys = jax.random.split(key, max_new_tokens)
-
-        def while_step(carry):
-            cache, token, step_idx, tokens, all_logits, done_mask = carry
-            if progress_bar:
-                jax.debug.print("Decoding step {}/{}", step_idx, max_new_tokens - 1)
-
+        def step(cache, token):
+            # Images are already embedded in the cache.
             out = self(
                 input_ids=token[:, None],
-                pixel_values=None,
-                image_grid_thw=None,
                 attention_mask=attention_mask,
                 cache=cache,
-                rope_deltas=output.rope_deltas,
+                rope_deltas=prefill.rope_deltas,
             )
+            return out.logits[:, -1, :], out.cache
 
-            assert out.logits.shape[1] == 1
-            logits = out.logits[:, -1, :]
-            sampled = jnp.where(
-                temperature > 0,
-                jax.random.categorical(keys[step_idx], logits / temperature, axis=-1),
-                jnp.argmax(logits, axis=-1),
-            )
-            next_token = jnp.where(done_mask, pad_token_id, sampled)
-            new_done_mask = done_mask | (stop_active & (next_token == stop_token_id))
-
-            if all_logits is not None:
-                all_logits = all_logits.at[:, step_idx, :].set(logits)
-            tokens = tokens.at[:, step_idx].set(next_token)
-
-            return (out.cache, next_token, step_idx + 1, tokens, all_logits, new_done_mask)
-
-        def while_cond(carry):
-            _, _, step_idx, _, _, done_mask = carry
-            all_done = stop_active & jnp.all(done_mask)
-            return (~all_done) & (step_idx < max_new_tokens - 1)
-
-        if max_new_tokens > 1:
-            tokens = jnp.full((batch_size, max_new_tokens - 1), pad_token_id, dtype=jnp.int32)
-            if return_logits:
-                all_logits = jnp.zeros(
-                    (batch_size, max_new_tokens - 1, self.vocab_size), dtype=jnp.float32
-                )
-            else:
-                all_logits = None
-            init = (cache, first_token, 0, tokens, all_logits, done_init)
-            final_carry = jax.lax.while_loop(while_cond, while_step, init)
-            final_cache, _, _, gen_tokens, gen_logits, _ = final_carry
-            all_tokens = jnp.concatenate(
-                [input_ids, first_token[:, None], gen_tokens], axis=1
-            )
-            if return_logits:
-                all_logits = jnp.concatenate(
-                    [first_token_logits[:, None, :], gen_logits], axis=1
-                )
-        else:
-            final_cache = cache
-            all_tokens = jnp.concatenate([input_ids, first_token[:, None]], axis=1)
-            all_logits = first_token_logits[:, None, :] if return_logits else None
-
-        return Qwen35GenerateOutput(tokens=all_tokens, cache=final_cache, logits=all_logits)
+        tokens, cache, logits = causal_lm.decode(
+            step,
+            prefill.last_logits,
+            prefill.cache,
+            key=key,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            stop_token_id=stop_token_id,
+            pad_token_id=pad_token_id,
+            return_logits=return_logits,
+            progress_bar=progress_bar,
+        )
+        return Qwen35GenerateOutput(
+            tokens=jnp.concatenate([input_ids, tokens], axis=1), cache=cache, logits=logits
+        )
 
 
 __all__ = [

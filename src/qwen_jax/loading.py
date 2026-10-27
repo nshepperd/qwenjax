@@ -20,19 +20,26 @@ from .param import AbstractParam, path_to_key
 T = TypeVar("T", bound=eqx.Module)
 
 
-def load_state_dict(module: T, state_dict: dict[str, jax.Array]) -> T:
+def load_state_dict(
+    module: T, state_dict: dict[str, jax.Array], *, allow_missing: bool = False
+) -> T:
     """Fill every Param in `module` from `state_dict`.
 
     A Param's path in the tree is its key in the state dict, so no module needs
     a load method of its own -- containers are traversed, Params are loaded.
     Keys are consumed as they are used, so whatever remains in `state_dict`
     afterwards is exactly what went unclaimed.
+
+    With `allow_missing`, params whose key is absent are left unset instead of
+    raising (a vision tower with no mmproj to fill it, say).
     """
 
     def visit(path: jax.tree_util.KeyPath, module: eqx.Module) -> eqx.Module:
-        if isinstance(module, AbstractParam):
-            return module.load_state_dict(state_dict, path)
-        return module
+        if not isinstance(module, AbstractParam):
+            return module
+        if allow_missing and path_to_key(path) not in state_dict:
+            return module
+        return module.load_state_dict(state_dict, path)
 
     return eu.mapmod_with_path(visit, module)
 

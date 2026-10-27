@@ -48,6 +48,22 @@ class RopeScalingConfig(BaseModel):
     # Qwen3.5 uses 0.25 (64 of 256 dims). None means all of it, as in Qwen3-VL.
     partial_rotary_factor: float | None = None
 
+
+def lift_rope_theta(data):
+    """Lift `rope_theta` out of `rope_parameters`/`rope_scaling` to the top level.
+
+    Newer checkpoints (and transformers 5's to_dict) keep it nested; the model
+    code reads `config.rope_theta` directly. For use as a before-validator.
+    """
+    if not isinstance(data, dict) or "rope_theta" in data:
+        return data
+    for key in ("rope_parameters", "rope_scaling"):
+        nested = data.get(key)
+        if isinstance(nested, dict) and "rope_theta" in nested:
+            return {**data, "rope_theta": nested["rope_theta"]}
+    return data
+
+
 class Qwen3VLTextConfig(BaseModel):
     """Configuration for the Qwen3-VL text decoder."""
 
@@ -74,22 +90,7 @@ class Qwen3VLTextConfig(BaseModel):
     attention_bias: bool = False
     attention_dropout: float = 0.0
 
-    @model_validator(mode="before")
-    @classmethod
-    def _lift_rope_theta(cls, data):
-        # Newer checkpoints embed `rope_theta` inside `rope_parameters` instead of
-        # exposing it as a top-level field. Lift it out so the rest of the code
-        # can keep reading `config.rope_theta` directly.
-        if not isinstance(data, dict):
-            return data
-        if "rope_theta" in data:
-            return data
-        for key in ("rope_parameters", "rope_scaling"):
-            nested = data.get(key)
-            if isinstance(nested, dict) and "rope_theta" in nested:
-                data = {**data, "rope_theta": nested["rope_theta"]}
-                break
-        return data
+    _lift_rope_theta = model_validator(mode="before")(lift_rope_theta)
 
 class Qwen3VLConfig(BaseModel):
     """Configuration for the Qwen3-VL multimodal model."""

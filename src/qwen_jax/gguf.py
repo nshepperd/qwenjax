@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Self
+from typing import Self, TypeVar
 
 import equinox as eqx
 import gguf_jax
@@ -39,8 +39,11 @@ from jaxtyping import Array
 from . import equinox_utils as eu
 from .config import Qwen3VLConfig
 from .linear import Embedding, Linear
+from .loading import load_state_dict
 from .model import Qwen3VLForConditionalGeneration
 from .param import AbstractParam, Param, path_to_key
+
+T = TypeVar("T", bound=eqx.Module)
 
 # Stored as plain floats: nothing to decode at inference time, so these are
 # dequantized once at load and held as ordinary arrays.
@@ -99,15 +102,24 @@ class UnmappedTensor(KeyError):
     """A GGUF tensor whose name has no counterpart in the model tree."""
 
 
-def text_key(name: str) -> str:
-    """The state dict key for a text-model GGUF tensor name."""
-    if name in _TEXT_MAP:
-        return _TEXT_MAP[name]
+def rename(name: str, top: dict[str, str], per_layer: dict[str, str], layers_prefix: str) -> str:
+    """Translate a llama.cpp text-model tensor name through a model's tables.
+
+    `top` maps whole names; `per_layer` maps the part after `blk.{n}.`, which
+    lands under `{layers_prefix}.{n}.`.
+    """
+    if name in top:
+        return top[name]
     if m := _RE_TEXT_LAYER.match(name):
         n, rest = m.group(1), m.group(2)
-        if rest in _TEXT_LAYER_MAP:
-            return f"{_TEXT_PREFIX}.layers.{n}.{_TEXT_LAYER_MAP[rest]}"
+        if rest in per_layer:
+            return f"{layers_prefix}.{n}.{per_layer[rest]}"
     raise UnmappedTensor(name)
+
+
+def text_key(name: str) -> str:
+    """The state dict key for a text-model GGUF tensor name."""
+    return rename(name, _TEXT_MAP, _TEXT_LAYER_MAP, f"{_TEXT_PREFIX}.layers")
 
 
 def vision_key(name: str, deepstack_indexes: tuple[int, ...]) -> str:
@@ -236,38 +248,90 @@ class EmbeddingGGUF(eqx.Module):
         ).dequantize()
 
 
+def dense_or_quantized(tensor: QuantizedArray, dtype) -> Array | QuantizedArray:
+    """What a state dict holds for `tensor`: dense qtypes decoded to `dtype`,
+    quantized ones left as they are."""
+    return tensor.dequantize(dtype) if tensor.qtype in DENSE_TYPES else tensor
+
+
+def mmproj_state_dict(
+    mmproj_path: str | Path,
+    deepstack_indexes: tuple[int, ...],
+    dtype=jnp.bfloat16,
+) -> dict[str, Array | QuantizedArray]:
+    """Read an mmproj (vision tower) GGUF into state dict entries.
+
+    The patch embedding is the one tensor that is not a rename: the mmproj
+    splits the conv3d kernel across its two temporal slices
+    (`v.patch_embd.weight` and `.weight.1`), which are stacked back into the
+    single (out, in, t, h, w) weight the model declares.
+    """
+    vision = load_gguf(str(mmproj_path), dtype=dtype).tensors
+    patch = [vision.pop(k) for k in ("v.patch_embd.weight", "v.patch_embd.weight.1")]
+    state_dict: dict[str, Array | QuantizedArray] = {
+        f"{_VISION_PREFIX}.patch_embed.proj.weight": jnp.stack(
+            [p.dequantize(dtype) for p in patch], axis=2
+        )
+    }
+    for name, tensor in vision.items():
+        state_dict[vision_key(name, deepstack_indexes)] = dense_or_quantized(tensor, dtype)
+    return state_dict
+
+
 def gguf_state_dict(
     gguf_path: str | Path,
     mmproj_path: str | Path | None,
     deepstack_indexes: tuple[int, ...],
     dtype=jnp.bfloat16,
 ) -> dict[str, Array | QuantizedArray]:
-    """Read a GGUF pair into a state dict keyed the way the model tree is.
+    """Read a Qwen3-VL GGUF pair into a state dict keyed the way the model tree is.
 
     Dense tensors come back as arrays of `dtype`; quantized ones stay
-    `QuantizedArray`. The vision patch embedding is the one tensor that is not
-    a rename: the mmproj splits the conv3d kernel across its two temporal
-    slices (`v.patch_embd.weight` and `.weight.1`), which are stacked back into
-    the single (out, in, t, h, w) weight the model declares.
+    `QuantizedArray`.
     """
-    state_dict: dict[str, Array | QuantizedArray] = {}
-
-    def add(key: str, tensor: QuantizedArray) -> None:
-        state_dict[key] = tensor.dequantize(dtype) if tensor.qtype in DENSE_TYPES else tensor
-
-    for name, tensor in load_gguf(str(gguf_path), dtype=dtype).tensors.items():
-        add(text_key(name), tensor)
-
+    state_dict: dict[str, Array | QuantizedArray] = {
+        text_key(name): dense_or_quantized(tensor, dtype)
+        for name, tensor in load_gguf(str(gguf_path), dtype=dtype).tensors.items()
+    }
     if mmproj_path is not None:
-        vision = load_gguf(str(mmproj_path), dtype=dtype).tensors
-        patch = [vision.pop(k) for k in ("v.patch_embd.weight", "v.patch_embd.weight.1")]
-        state_dict[f"{_VISION_PREFIX}.patch_embed.proj.weight"] = jnp.stack(
-            [p.dequantize(dtype) for p in patch], axis=2
-        )
-        for name, tensor in vision.items():
-            add(vision_key(name, deepstack_indexes), tensor)
-
+        state_dict.update(mmproj_state_dict(mmproj_path, deepstack_indexes, dtype))
     return state_dict
+
+
+def load_into(
+    model: T,
+    state_dict: dict[str, Array | QuantizedArray],
+    *,
+    fused: bool = True,
+    allow_missing: bool = False,
+    error_on_unused: bool = True,
+) -> T:
+    """Fill `model` from a GGUF-derived state dict.
+
+    Every Linear/Embedding whose weight arrived quantized is first swapped for
+    its GGUF counterpart, so the param it holds can take a QuantizedArray;
+    then the ordinary param walk fills everything. `allow_missing` leaves
+    params with no entry unset (a vision tower without its mmproj).
+    """
+    quantized = {k for k, v in state_dict.items() if isinstance(v, QuantizedArray)}
+
+    def swap(path: jax.tree_util.KeyPath, module: eqx.Module) -> eqx.Module:
+        if f"{path_to_key(path)}.weight" not in quantized:
+            return module
+        if isinstance(module, Linear):
+            return LinearGGUF(
+                module.in_features, module.out_features,
+                use_bias=module.use_bias, fused=fused,
+            )
+        if isinstance(module, Embedding):
+            return EmbeddingGGUF(module.num_embeddings, module.embedding_dim)
+        return module
+
+    model = eu.mapmod_with_path(swap, model)
+    model = load_state_dict(model, state_dict, allow_missing=allow_missing)  # type: ignore[arg-type]
+    if error_on_unused and state_dict:
+        raise AssertionError(f"Unused keys in state dict: {sorted(state_dict)}")
+    return model
 
 
 def load_qwen3_gguf(
@@ -296,46 +360,19 @@ def load_qwen3_gguf(
             per use -- slower and far more memory, but a useful A/B.
     """
     config = Qwen3VLConfig.from_pretrained(pretrained_model_name_or_path=Path(config_path))
-    model = Qwen3VLForConditionalGeneration(config)
-
     state_dict = gguf_state_dict(
         gguf_path,
         mmproj_path,
         tuple(config.vision_config.deepstack_visual_indexes),
         dtype=dtype,
     )
-    quantized = {k for k, v in state_dict.items() if isinstance(v, QuantizedArray)}
-
-    def visit(path: jax.tree_util.KeyPath, module: eqx.Module) -> eqx.Module:
-        if f"{path_to_key(path)}.weight" not in quantized:
-            return module
-        if isinstance(module, Linear):
-            return LinearGGUF(
-                module.in_features, module.out_features,
-                use_bias=module.use_bias, fused=fused,
-            )
-        if isinstance(module, Embedding):
-            return EmbeddingGGUF(module.num_embeddings, module.embedding_dim)
-        return module
-
-    model = eu.mapmod_with_path(visit, model)
-
-    # Without an mmproj the vision params have nothing to load from; leave
-    # them unset rather than fail the walk over them.
-    allow_missing = mmproj_path is None
-
-    def fill(path: jax.tree_util.KeyPath, module: eqx.Module) -> eqx.Module:
-        if not isinstance(module, AbstractParam):
-            return module
-        if allow_missing and path_to_key(path) not in state_dict:
-            return module
-        return module.load_state_dict(state_dict, path)
-
-    model = eu.mapmod_with_path(fill, model)
-
-    if error_on_unused and state_dict:
-        raise AssertionError(f"Unused keys in state dict: {sorted(state_dict)}")
-    return model
+    return load_into(
+        Qwen3VLForConditionalGeneration(config),
+        state_dict,
+        fused=fused,
+        allow_missing=mmproj_path is None,
+        error_on_unused=error_on_unused,
+    )
 
 
 __all__ = [
@@ -343,8 +380,12 @@ __all__ = [
     "GGUFParam",
     "LinearGGUF",
     "UnmappedTensor",
+    "dense_or_quantized",
     "gguf_state_dict",
+    "load_into",
     "load_qwen3_gguf",
+    "mmproj_state_dict",
+    "rename",
     "text_key",
     "vision_key",
 ]

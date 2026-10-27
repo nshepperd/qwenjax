@@ -17,7 +17,7 @@ from pathlib import Path
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
-from qwen_jax.config import Qwen3VLVisionConfig, RopeScalingConfig
+from qwen_jax.config import Qwen3VLVisionConfig, RopeScalingConfig, lift_rope_theta
 
 
 class Qwen35TextConfig(BaseModel):
@@ -64,21 +64,7 @@ class Qwen35TextConfig(BaseModel):
         validation_alias=AliasChoices("rope_parameters", "rope_scaling"),
     )
 
-    @model_validator(mode="before")
-    @classmethod
-    def _lift_rope_theta(cls, data):
-        # Qwen3.5 checkpoints keep rope_theta inside rope_parameters; lift it
-        # out so the rest of the code reads config.rope_theta directly.
-        if not isinstance(data, dict):
-            return data
-        if "rope_theta" in data:
-            return data
-        for key in ("rope_parameters", "rope_scaling"):
-            nested = data.get(key)
-            if isinstance(nested, dict) and "rope_theta" in nested:
-                data = {**data, "rope_theta": nested["rope_theta"]}
-                break
-        return data
+    _lift_rope_theta = model_validator(mode="before")(lift_rope_theta)
 
     def resolved_layer_types(self) -> tuple[str, ...]:
         """One of "linear_attention"/"full_attention" per layer."""
