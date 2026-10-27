@@ -2,3 +2,6 @@
 __pycache__/
 transformers.git
 runs
+.env
+.playwright-mcp/
+*.png
