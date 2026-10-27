@@ -134,7 +134,7 @@ class Qwen3VLTextModel(eqx.Module):
         # This is element-wise addition
         hidden_states = jnp.where(
             visual_pos_masks[..., None],
-            hidden_states + gathered,
+            hidden_states + gathered.astype(hidden_states.dtype),
             hidden_states
         )
         return hidden_states

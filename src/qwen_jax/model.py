@@ -131,11 +131,13 @@ class Qwen3VLModel(eqx.Module):
         )
         batch_size = input_ids.shape[0]
         image_idx = jnp.cumsum(jnp.reshape(image_mask, [-1])) - 1
+        # The vision tower runs in the pixels' float32 when the processor hands
+        # those over; the text model stays in its own dtype, as in HF.
         image_embeds_i = rearrange(
             image_embeds[image_idx],
             "(b seq) hidden -> b seq hidden",
             b=batch_size,
-        )
+        ).astype(inputs_embeds.dtype)
         inputs_embeds = jnp.where(image_mask[..., None], image_embeds_i, inputs_embeds)
         return inputs_embeds, image_mask, deepstack_image_embeds
 

@@ -81,6 +81,16 @@ def jsdiv(logits1, logits2):
     return _H(M) - 0.5 * (_H(logits1) + _H(logits2))
 
 
+def at_text_positions(div, input_ids, model):
+    """`div` at the positions that are not image placeholders.
+
+    The prediction made at a placeholder (whose next token is another
+    placeholder) means nothing, and bf16 rounding moves it by several
+    hundredths of a nat where real text positions stay under 0.01.
+    """
+    return np.asarray(div)[np.asarray(input_ids) != model.config.image_token_id]
+
+
 @pytest.fixture
 def large_image_inputs():
     processor = Qwen3VLProcessor.from_pretrained(QWEN3VL_MODEL_PATH)
@@ -180,7 +190,11 @@ def test_vision(hf_model: HFModel, jax_model: Qwen3VLForConditionalGeneration):
             )
 
     np.testing.assert_allclose(
-        jsdiv(output_jax.logits, output_pt.logits.detach().cpu().numpy()),
+        at_text_positions(
+            jsdiv(output_jax.logits, output_pt.logits.detach().cpu().numpy()),
+            inputs["input_ids"],
+            jax_model,
+        ),
         0.0,
         atol=2e-2,
     )
@@ -422,9 +436,13 @@ def test_vision_with_cache(jax_model: Qwen3VLForConditionalGeneration):
         rope_deltas=output1.rope_deltas,
     )
 
-    div = jsdiv(
-        output_full.logits,
-        jnp.concatenate([output1.logits, output2.logits], axis=1),
+    div = at_text_positions(
+        jsdiv(
+            output_full.logits,
+            jnp.concatenate([output1.logits, output2.logits], axis=1),
+        ),
+        inputs.input_ids,
+        jax_model,
     )
 
     np.testing.assert_allclose(div, 0.0, rtol=1e-2, atol=1e-2)
@@ -497,7 +515,11 @@ def test_padding_vision(
     )
     output_padded = jax_model(**inputs_padded)
     np.testing.assert_allclose(
-        jsdiv(output.logits, output_padded.logits[:, -output.logits.shape[1] :]),
+        at_text_positions(
+            jsdiv(output.logits, output_padded.logits[:, -output.logits.shape[1] :]),
+            inputs["input_ids"],
+            jax_model,
+        ),
         0.0,
         rtol=1e-2,
         atol=1e-2,
