@@ -34,6 +34,7 @@ test = [
     "wandb",
     "hypothesis",
     "pyarrow>=25.0.1",
+    "sentencepiece>=0.2.2",
 ]
 
 [build-system]
@@ -66,15 +67,16 @@ root = ["./src/"]
 # cutejax is newly published on PyPI, so it sits inside the global
 # exclude-newer window; let it through.
 exclude-newer-package = { cutejax = "2100-01-01" }
-# gguf-jax floors jax at >=0.11.0, but the wheels we have are 0.8.3, so pin the
-# bound down.
+# jax 0.12 is the first release whose XLA gives host<->device copies their own
+# stream (openxla/xla#49046), which weight streaming from pinned_host needs to
+# overlap copies with compute.
 #
-# That matters: jax's FFI registration API changed after 0.8, so
-# the CuTe kernels need a jax-tvm-ffi matched to jaxlib. On 0.8.x that is 0.1.2 --
-# with 0.1.3 every kernel registers into tvm-ffi's own table and none of them
-# reach jaxlib's, and each call dies with "No FFI handler registered for
-# cutejax.<kernel> on a platform CUDA". Silent until the first fused matmul runs.
+# jax-tvm-ffi stays pinned: the CuTe kernels need a jax-tvm-ffi whose FFI
+# registration reaches jaxlib's table. 0.1.2 does (on 0.8.x and 0.11.x); with
+# 0.1.3 on 0.8.x every kernel registered into tvm-ffi's own table instead, and
+# each call died with "No FFI handler registered for cutejax.<kernel> on a
+# platform CUDA" -- silent until the first fused matmul runs.
 override-dependencies = [
-    "jax[cuda12]>=0.8.2,<0.9.0",
+    "jax[cuda13]>=0.12.0",
     "jax-tvm-ffi==0.1.2",
 ]
