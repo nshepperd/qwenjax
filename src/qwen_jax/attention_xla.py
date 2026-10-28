@@ -72,8 +72,8 @@ def causal_mask(
     """Causal mask for `seq_len` queries starting at absolute position `query_offset`.
 
     A query attends a key when the key is unpadded and does not come after it.
-    The flash path expresses the same relation as a mask mod
-    (`attention.PaddedCausalMask`) evaluated inside the kernel.
+    The flash path gets the same relation from the kernel's native causal
+    path (aligned on the filled length) plus `attention.KeyPaddingMask`.
     """
     kv_pos = jnp.arange(kv_mask.shape[0])
     q_pos = query_offset + jnp.arange(seq_len)

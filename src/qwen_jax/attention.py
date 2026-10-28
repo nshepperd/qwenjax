@@ -7,7 +7,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 from einops import rearrange
-from fa4_jax import MaskMod, document_mask, flash_attn
+from fa4_jax import MaskMod, document_mask, flash_attn, flash_attn_varlen
 from jaxtyping import Array, Bool, Float, Int
 
 from qwen_jax.config import Qwen3VLTextConfig
@@ -19,21 +19,16 @@ from .rope import apply_rotary_pos_emb, apply_rotary_pos_emb_vision
 
 
 @dataclass(frozen=True)
-class PaddedCausalMask(MaskMod):
-    """Causal attention over a padded key sequence.
+class KeyPaddingMask(MaskMod):
+    """Drops padded keys; causality is left to the kernel's native path.
 
-    A query at absolute position ``offset[b] + q_idx`` attends a key when the
-    key is unpadded and does not come after it -- the flash-kernel form of
-    `attention_xla.causal_mask`. Both fields are runtime data (int32, since the
-    kernel codegen indexes them as tensors), so every prompt shape and cache
-    position reuses one compiled kernel.
+    An array field, so every prompt's padding reuses one compiled kernel.
     """
 
     key_valid: Int[Array, "batch kv_seq"]
-    offset: Int[Array, "batch"]
 
     def __call__(self, b, h, q_idx, kv_idx):
-        return (kv_idx <= q_idx + self.offset[b]) & (self.key_valid[b, kv_idx] != 0)
+        return self.key_valid[b, kv_idx] != 0
 
 
 class Qwen3VLVisionAttention(eqx.Module):
@@ -188,25 +183,32 @@ def masked_causal_attention(
         # the kernel's native causal path (which skips future KV blocks)
         # does the causality and the mask mod only drops padded keys.
         assert kv_mask.shape == (batch_size, seq_len)
-        mask = PaddedCausalMask(
-            key_valid=kv_mask.astype(jnp.int32),
-            offset=jnp.zeros((batch_size,), jnp.int32),
-        )
         attn_output = flash_attn(
-            q, k, v, causal=True, mask_mod=mask, backend="cute"
+            q, k, v, causal=True,
+            mask_mod=KeyPaddingMask(key_valid=kv_mask.astype(jnp.int32)),
+            backend="cute",
         )
     elif kv_mask is not None and cache_position is not None:
-        # Queries sit at cache_position.. within the cache, which is not
-        # the bottom-right alignment the native causal path assumes, so
-        # the mask mod carries the offset instead. Padded and not-yet-
-        # written cache slots are both dropped by the mask: the former by
-        # kv_mask, the latter by causality.
-        assert kv_mask.shape == (batch_size, k.shape[1])
-        mask = PaddedCausalMask(
-            key_valid=kv_mask.astype(jnp.int32),
-            offset=jnp.full((batch_size,), cache_position, jnp.int32),
-        )
-        attn_output = flash_attn(q, k, v, mask_mod=mask, backend="cute")
+        # Queries sit at cache_position.. within a cache allocated longer
+        # than it is filled. As varlen slots with seqused_k set to the filled
+        # length, the native causal path aligns on that length -- query i at
+        # cache_position + i -- and the kernel never visits the empty tail,
+        # so the cost follows the filled length, not the allocation. The
+        # mask mod only drops padded keys.
+        kv_len = k.shape[1]
+        assert kv_mask.shape == (batch_size, kv_len)
+        slots = jnp.arange(batch_size + 1, dtype=jnp.int32)
+        attn_output = flash_attn_varlen(
+            q.reshape(batch_size * seq_len, *q.shape[2:]),
+            k.reshape(batch_size * kv_len, *k.shape[2:]),
+            v.reshape(batch_size * kv_len, *v.shape[2:]),
+            slots * seq_len,
+            slots * kv_len,
+            seqused_k=jnp.full((batch_size,), cache_position + seq_len, jnp.int32),
+            causal=True,
+            mask_mod=KeyPaddingMask(key_valid=kv_mask.astype(jnp.int32)),
+            backend="cute",
+        ).reshape(q.shape[:3] + v.shape[3:])
     else:
         raise NotImplementedError(
             "Causal attention without mask is not implemented."
