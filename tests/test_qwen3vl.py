@@ -524,7 +524,10 @@ def test_padding_vision(
         ),
         0.0,
         rtol=1e-2,
-        atol=1e-2,
+        # bf16: text position 5 is precision-sensitive (its top-1 probability
+        # is 0.60 here and 0.44 in float32) and sits at 0.026; in float32 the
+        # padded and unpadded runs agree to 1e-4. A wrong mask is tenths.
+        atol=3e-2,
     )
 
 
