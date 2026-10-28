@@ -1,6 +1,6 @@
 """Probe: how long a context Saluki (qwen35 GGUF) holds, and what it costs.
 
-For each length L: allocate a cache of L + decode steps, prefill L random
+For each length L: allocate a cache of L + decode steps (or --alloc), prefill L random
 tokens in fixed-size chunks through the cache (cache donated, so only one
 copy of the KV is live), then time single-token decode steps at that depth.
 Stops at the first length that fails to allocate.
@@ -13,8 +13,10 @@ Stops at the first length that fails to allocate.
       XLA_PYTHON_CLIENT_MEM_FRACTION=3.0 uv run python bench/context_probe.py ...
 
 The environment is read as given (phenex's shell defaults to unified memory,
-so say which you mean). Prefill temp memory scales with --chunk, not with
-the context: at 2048 the DeltaNet chunk intermediates alone are ~2.4 GB.
+so say which you mean). Prefill temp memory grows with --chunk, not with the
+context (0.84 GB at 512, 2.4 GB at 2048 for Saluki); part of it is the
+dequantized-weight scratch of the prefill matmuls, a fixed ~0.36 GB per MLP
+weight. --alloc fixes the cache allocation across lengths, as a server would.
 """
 from __future__ import annotations
 
@@ -53,6 +55,8 @@ def main():
     parser.add_argument("--lengths", default="16384,32768,49152,65536,81920,98304")
     parser.add_argument("--chunk", type=int, default=2048)
     parser.add_argument("--decode-steps", type=int, default=8)
+    parser.add_argument("--alloc", type=int, default=None,
+                        help="allocate every cache at this many slots (default: length + steps)")
     args = parser.parse_args()
 
     dev = jax.devices()[0]
@@ -71,7 +75,7 @@ def main():
     for length in (int(x) for x in args.lengths.split(",")):
         assert length % args.chunk == 0, "lengths must be multiples of --chunk"
         try:
-            cache = model.create_cache(1, length + args.decode_steps)
+            cache = model.create_cache(1, args.alloc or length + args.decode_steps)
             kv_bytes = sum(
                 x.nbytes for layer in cache.layers if hasattr(layer, "keys")
                 for x in (layer.keys, layer.values)
