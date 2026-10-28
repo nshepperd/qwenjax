@@ -14,6 +14,7 @@ from qwen_jax.config import Qwen3VLTextConfig
 
 from . import attention_xla as axla
 from .cache import KVCacheLayer
+from .decode_attention import decode_attention
 from .linear import Linear, RMSNorm
 from .rope import apply_rotary_pos_emb, apply_rotary_pos_emb_vision
 
@@ -127,10 +128,9 @@ class Qwen3VLVisionAttention(eqx.Module):
         return self.proj(attn_output)
 
 
-# Below this many queries a cached attention call takes the XLA path; see
-# masked_causal_attention. fa4 tiles queries 64 rows at a time, so these
-# calls would leave its tiles mostly empty anyway.
-_XLA_DECODE_MAX_QUERIES = 16
+# A cached call whose query rows (queries x GQA group) fit in one warp's
+# registers goes to the split-KV decode kernel; see masked_causal_attention.
+_DECODE_MAX_ROWS = 16
 
 
 def masked_causal_attention(
@@ -152,12 +152,21 @@ def masked_causal_attention(
     dtype of q.
     """
     batch_size, seq_len = q.shape[:2]
-    # A few queries against a cache (decode) go to XLA: its score matrix is
-    # then tiny, and fa4 has no split-KV, so one CTA per head walks the
-    # whole cache -- 10x slower at Qwen3.5's shape (24q/4kv heads, dim 256,
-    # 32K cache: 1.74 ms vs 0.18 ms per layer on the 5070 Ti).
-    decode = cache_position is not None and seq_len <= _XLA_DECODE_MAX_QUERIES
-    use_flash = axla.use_flash() and not decode
+    use_flash = axla.use_flash()
+    # Decode -- a few queries against a cache -- goes to the split-KV kernel:
+    # fa4 has no split-KV, so it walks the whole cache one CTA per head (10x
+    # slower than even XLA at Qwen3.5's shape), and XLA reads the whole
+    # *allocated* cache, where the kernel reads only the filled slots.
+    if (
+        use_flash
+        and cache_position is not None
+        and kv_mask is not None
+        and seq_len * (q.shape[2] // k.shape[2]) <= _DECODE_MAX_ROWS
+        and k.dtype == v.dtype == jnp.bfloat16
+        and q.shape[-1] in (128, 256)
+    ):
+        seqused = jnp.full((batch_size,), cache_position + seq_len, jnp.int32)
+        return decode_attention(q, k, v, kv_mask, seqused)
     dtype = q.dtype
     if dtype == jnp.float32 and use_flash:
         # The flash kernel only takes 16-bit inputs; the XLA path does not
